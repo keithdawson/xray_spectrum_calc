@@ -1,0 +1,1 @@
+extractor.py takes all NIST z#.html files in the current folder and makes a CSV from the attenuation coefficients (Mu over rho)

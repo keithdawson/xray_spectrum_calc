@@ -1,0 +1,1 @@
+Used this to make a csv input curve (useless after finding SPEKPY)
