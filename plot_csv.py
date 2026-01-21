@@ -3,9 +3,10 @@ import matplotlib.pyplot as plt
 import sys
 
 def plot_spectrum(csv_file=None):
-    # If no file was passed in, prompt the user
+    # If no file was passed in, use default
     if csv_file is None:
-        csv_file = input("Enter the CSV filename: ").strip()
+        csv_file = 'filtered_spectrum.csv'
+        print(f"No file specified. Plotting default: {csv_file}")
     
     # Load CSV
     df = pd.read_csv(csv_file)
@@ -25,7 +26,7 @@ def plot_spectrum(csv_file=None):
     plt.show()
 
 if __name__ == "__main__":
-    # If the script was run with an argument, use it; else prompt
+    # If the script was run with an argument, use it; else use default
     if len(sys.argv) > 1:
         plot_spectrum(sys.argv[1])
     else:
