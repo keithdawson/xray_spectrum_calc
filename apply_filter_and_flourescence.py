@@ -63,7 +63,7 @@ AIR_COMPOSITION = {
 def get_element_properties(symbol_or_z):
     """Returns Z, Symbol for a given input."""
     # Maps for common elements
-    sym_to_z = {"Mo":42, "Pb":82, "Cu":29, "W":74, "Ag":47, "Al":13, "N":7, "O":8, "Ar":18}
+    sym_to_z = {"Mo":42, "Pb":82, "Cu":29, "W":74, "Ag":47, "Al":13, "N":7, "O":8, "Ar":18, "Fe":26, "Au":79}
     z_to_sym = {v: k for k, v in sym_to_z.items()}
     
     if str(symbol_or_z).isdigit():
@@ -84,8 +84,8 @@ def get_mixture_attenuation(energy_axis, components, att_df):
     Computes effective mu/rho for a mixture.
     components: dict {Z: weight_fraction}
     """
-    mu_mix = np.zeros_like(energy_axis)
-    mu_en_mix = np.zeros_like(energy_axis)
+    mu_mix = np.zeros_like(energy_axis, dtype=float)
+    mu_en_mix = np.zeros_like(energy_axis, dtype=float)
     
     for z, weight in components.items():
         elem_df = att_df[att_df['Element'] == z]
@@ -107,6 +107,9 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
     Processes one layer of material.
     geom_params: dict with 'radius_mm', 'distance_mm'
     """
+    # 0. Bin widths for integration/density conversion
+    dE = np.gradient(E_in)
+
     # 1. Geometry factor (Solid Angle Fraction)
     # Omega / 4pi = (1 - cos(theta)) / 2
     theta = math.atan2(geom_params['radius_mm'], geom_params['distance_mm'])
@@ -120,6 +123,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         # unless specific K-lines of Ar are required.
         tauK_eff = np.zeros_like(E_in) 
         fluorescence_yield = 0.0
+        elem_att = None
         calc_fluorescence = False 
     else:
         z, sym = get_element_properties(material)
@@ -130,23 +134,39 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         mu_tot = np.interp(E_in, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
         
         # Get Fluorescence Data (EPDL) if needed
-        # (Simplified loading logic based on your script)
-        # You would load the ZAxxx_extracted.csv here to get tauK
-        # For this example, we assume we have vectors or 0 if file missing
-        tauK_eff = np.zeros_like(E_in) # Placeholder: Load your EPDL tauK here
+        tauK_eff = np.zeros_like(E_in)
+        if edpl_folder:
+            # Try to find file ZA{z:03d}*.csv
+            p = Path(edpl_folder)
+            candidates = list(p.glob(f"*ZA{z:03d}*.csv"))
+            if candidates:
+                try:
+                    df_edpl = pd.read_csv(candidates[0])
+                    # Check for required columns
+                    if 'E_keV' in df_edpl.columns and 'tauK_over_rho_cm2_per_g' in df_edpl.columns:
+                        tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl['tauK_over_rho_cm2_per_g'], left=0, right=0)
+                except Exception:
+                    pass
+
+        # Fluorescence Parameters
+        fl_params = {
+            42: {'yield': 0.765, 'Ka': 17.48, 'Kb': 19.61}, # Mo
+            82: {'yield': 0.963, 'Ka': 74.97, 'Kb': 84.94}, # Pb
+            74: {'yield': 0.94,  'Ka': 59.32, 'Kb': 67.24}, # W
+            29: {'yield': 0.44,  'Ka': 8.05,  'Kb': 8.90},  # Cu
+            26: {'yield': 0.32,  'Ka': 6.40,  'Kb': 7.06},  # Fe
+            47: {'yield': 0.83,  'Ka': 22.16, 'Kb': 24.94}, # Ag
+            79: {'yield': 0.96,  'Ka': 68.80, 'Kb': 77.98}, # Au
+        }
         
-        # Determine Omega and K-Energies (Values from your script or lookups)
-        # Example for Mo (Z=42)
-        if z == 42: 
-            fluorescence_yield = 0.765
-            E_Ka, E_Kb = 17.48, 19.61
-            K_ratio = 1.0 / (1.0 + 0.12) # Kalpha branching
-        elif z == 82: # Pb
-             fluorescence_yield = 0.963
-             E_Ka, E_Kb = 74.97, 84.94
-             K_ratio = 1.0 / (1.0 + 0.12)
+        if z in fl_params:
+            f_data = fl_params[z]
+            fluorescence_yield = f_data['yield']
+            E_Ka = f_data['Ka']
+            E_Kb = f_data['Kb']
         else:
-             fluorescence_yield = 0.0 # Placeholder
+            fluorescence_yield = 0.0
+            E_Ka, E_Kb = 0.0, 0.0
              
     # 3. Attenuation Calculation
     t_cm = thickness_mm / 10.0
@@ -165,74 +185,162 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         
         # Fraction of interactions that are photoelectric K-shell
         # Note: Avoid divide by zero
-        frac_K_shell = np.divide(tauK_eff, mu_tot, out=np.zeros_like(mu_tot), where=mu_tot!=0)
+        with np.errstate(divide='ignore', invalid='ignore'):
+            frac_K_shell = np.where(mu_tot > 0, tauK_eff / mu_tot, 0.0)
         
         # Rate of vacancy creation
         vacancies = phi_in * prob_abs * frac_K_shell
         
         # Total isotropic emission
-        total_emission = np.trapz(vacancies, E_in) * fluorescence_yield
+        trapz = getattr(np, 'trapezoid', np.trapz)
+        total_emission = trapz(vacancies, E_in) * fluorescence_yield
         
         # Beam-directed emission (Geometric fraction)
-        # We also need self-absorption correction (Escape Probability) for the filter itself
-        # P_esc approx (1 - exp(-mu_emit * rho * t)) / (mu_emit * rho * t)
-        
-        # Add to specific bins for Ka and Kb
-        # (This adds the 'peaks' to the spectrum)
-        # ... [Logic from your script to add to closest energy bins] ...
-        
-        # For simplicity in this snippet, we just return the counts to be added
-        # You would distribute `total_emission * frac_accept * P_esc` into the bins
-        pass 
+        if total_emission > 0:
+            # K-alpha / K-beta split (approx 0.12 ratio Kbeta/Kalpha)
+            kb_ratio = 0.12
+            br_ka = 1.0 / (1.0 + kb_ratio)
+            br_kb = 1.0 - br_ka
+            
+            # Self-absorption (Escape Probability)
+            mu_Ka = np.interp(E_Ka, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+            mu_Kb = np.interp(E_Kb, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+            
+            def get_esc(mu, rt):
+                val = mu * rt
+                if val < 1e-5: return 1.0
+                return (1.0 - np.exp(-val)) / val
+            
+            esc_Ka = get_esc(mu_Ka, rho_t)
+            esc_Kb = get_esc(mu_Kb, rho_t)
+            
+            # Add to bins (convert total counts to density by dividing by dE)
+            idx_Ka = (np.abs(E_in - E_Ka)).argmin()
+            idx_Kb = (np.abs(E_in - E_Kb)).argmin()
+            
+            phi_fluorescence[idx_Ka] += (total_emission * br_ka * frac_accept * esc_Ka) / dE[idx_Ka]
+            phi_fluorescence[idx_Kb] += (total_emission * br_kb * frac_accept * esc_Kb) / dE[idx_Kb]
 
     return phi_transmitted + phi_fluorescence
 
-def run_stack(spectrum_csv, filter_stack, att_file):
+def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, out_path):
     """
-    filter_stack: list of dicts [{'material': 'Mo', 'thickness': 0.1}, {'material': 'Air', 'thickness': 1000}]
+    Processes a spectrum through a stack of filters.
+
+    Args:
+        spectrum_csv (str): Path to the input spectrum CSV.
+        filter_stack (list): List of filter dictionaries, e.g., [{'material': 'Mo', 'thickness': 0.1}].
+        att_file (str): Path to the master attenuation data file.
+        edpl_folder (str): Path to the folder with EPDL-extracted data.
+        geom_params (dict): Dictionary with geometry parameters ('radius_mm', 'distance_mm').
+        out_path (str): Path for the output CSV file.
     """
-    df = pd.read_csv(spectrum_csv)
+    try:
+        df = pd.read_csv(spectrum_csv)
+    except FileNotFoundError:
+        sys.exit(f"Error: Input spectrum file not found at '{spectrum_csv}'")
+
+    # Be flexible with input column names
+    if 'Energy_KeV' not in df.columns and 'Energy_keV' in df.columns:
+        df = df.rename(columns={'Energy_keV': 'Energy_KeV'})
+    if 'Photons_per_s' not in df.columns and 'Relative_Intensity' in df.columns:
+        df = df.rename(columns={'Relative_Intensity': 'Photons_per_s'})
+
+    if 'Energy_KeV' not in df.columns or 'Photons_per_s' not in df.columns:
+        sys.exit("Error: Input CSV must have columns like 'Energy_KeV' and 'Photons_per_s' or 'Energy_keV' and 'Relative_Intensity'")
+
     E = df['Energy_KeV'].values
     Phi = df['Photons_per_s'].values
-    att_df = pd.read_csv(att_file) # Load master attenuation file
     
-    print(f"Initial Photon Count: {np.sum(Phi):.2e}")
+    try:
+        att_df = pd.read_csv(att_file)
+    except FileNotFoundError:
+        sys.exit(f"Error: Attenuation file not found at '{att_file}'")
 
-    # Distance accumulation for geometry (optional, if distance is cumulative)
-    current_dist = 0 
+    # Handle energy units (MeV vs KeV) in attenuation file
+    if 'Energy_MeV' in att_df.columns and 'Energy_KeV' not in att_df.columns:
+        att_df['Energy_KeV'] = att_df['Energy_MeV'] * 1000
     
+    dE = np.gradient(E)
+    print(f"Initial Photon Count: {np.sum(Phi * dE):.2e}")
+
     for f in filter_stack:
         mat = f['material']
-        thick = f['thickness']
-        
-        # Assume detector is at the end of the stack? 
-        # Or assumes 'distance' is from current filter to detector.
-        # Let's assume a fixed detector distance defined globally or per filter relative to detector.
-        geom = {'radius_mm': 10.0, 'distance_mm': 100.0} # Example
+        thick = float(f['thickness'])
         
         print(f"Applying filter: {mat} ({thick} mm)...")
-        Phi = process_single_layer(E, Phi, mat, thick, att_df, "./pyne_edpl", geom)
+        Phi = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
         
-        print(f"  > Photon Count after {mat}: {np.sum(Phi):.2e}")
+        print(f"  > Photon Count after {mat}: {np.sum(Phi * dE):.2e}")
 
     # Output
-    pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi}).to_csv("final_spectrum.csv", index=False)
+    out_df = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi})
+    out_df.to_csv(out_path, index=False)
+    print(f"Wrote final spectrum to {out_path}")
+
 # ---------------------------
 # CLI
 def cli():
-    p = argparse.ArgumentParser(description="Apply filter + fluorescence to spectrum")
-    p.add_argument('--spectrum', required=True, help='input spectrum CSV (Energy_KeV, Photons_per_s)')
-    p.add_argument('--filter', required=True, help='filter element (Z number, e.g. 42, or symbol e.g. Mo)')
-    p.add_argument('--thickness-mm', required=True, type=float, help='filter thickness in mm')
-    p.add_argument('--edpl-folder', default='.', help='folder with EPDL-extracted CSV files')
-    p.add_argument('--attenuation', default='attenuation_coefficients_long.csv', help='path to attenuation_coefficients_long.csv')
-    p.add_argument('--acceptance-radius-mm', default=1.0, type=float, help='circular acceptance radius at detector (mm)')
-    p.add_argument('--distance-mm', default=100.0, type=float, help='distance from filter to acceptance plane (mm)')
-    p.add_argument('--kbeta_ratio', default=0.12, type=float, help='Kbeta / Kalpha intensity ratio (default 0.12)')
-    p.add_argument('--out', dest='out', default='spectrum_after_filter.csv', help='output CSV path')
+    p = argparse.ArgumentParser(
+        description="Apply a stack of filters to an X-ray spectrum and calculate fluorescence.",
+        formatter_class=argparse.RawTextHelpFormatter,
+        epilog="""
+Example Usage:
+  python %(prog)s \\
+    --spectrum 225_W_input.csv \\
+    --filter-materials Mo Al Air \\
+    --filter-thicknesses-mm 0.1 1.0 1000 \\
+    --out filtered_spectrum.csv
+"""
+    )
+    p.add_argument('--spectrum', required=True, help='Input spectrum CSV. Must have columns like (Energy_KeV, Photons_per_s).')
+    p.add_argument(
+        '--filter-materials',
+        required=True,
+        nargs='+',
+        help='Space-separated list of filter materials to apply, in order (e.g., Mo Al Air).'
+    )
+    p.add_argument(
+        '--filter-thicknesses-mm',
+        required=True,
+        nargs='+',
+        type=float,
+        help='Space-separated list of filter thicknesses in mm, matching the order of materials.'
+    )
+    p.add_argument('--attenuation', default='attenuation_coefficients_long.csv', help='Path to master attenuation data file.')
+    p.add_argument('--edpl-folder', default='pyne_edpl', help='Folder with EPDL-extracted CSV files for fluorescence.')
+    
+    # Geometry args
+    p.add_argument('--acceptance-radius-mm', type=float, default=10.0, help='Acceptance cone radius at detector (mm).')
+    p.add_argument('--distance-mm', type=float, default=100.0, help='Distance from the filter stack to the detector (mm).')
+
+    p.add_argument('--out', default='final_spectrum.csv', help='Output CSV file path.')
+    
     args = p.parse_args()
-    run(args.spectrum, args.filter, args.thickness_mm, args.edpl_folder, args.attenuation,
-        args.acceptance_radius_mm, args.distance_mm, args.kbeta_ratio, args.out)
+
+    # --- Parse Filters ---
+    if len(args.filter_materials) != len(args.filter_thicknesses_mm):
+        sys.exit("Error: The number of materials and thicknesses must be the same.")
+
+    filter_stack = []
+    for material, thickness in zip(args.filter_materials, args.filter_thicknesses_mm):
+        filter_stack.append({'material': material, 'thickness': thickness})
+
+    # --- Geom Params ---
+    geom_params = {
+        'radius_mm': args.acceptance_radius_mm,
+        'distance_mm': args.distance_mm
+    }
+    
+    # --- Run ---
+    run_stack(
+        spectrum_csv=args.spectrum,
+        filter_stack=filter_stack,
+        att_file=args.attenuation,
+        edpl_folder=args.edpl_folder,
+        geom_params=geom_params,
+        out_path=args.out
+    )
 
 if __name__ == '__main__':
     cli()
