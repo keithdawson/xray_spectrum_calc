@@ -51,6 +51,7 @@ DENSITIES = {
     "W": 19.25,
     "Ag": 10.49,
     "Au": 19.32,
+    "Sn": 7.31,
     "Air": 0.001225  # g/cm^3 at sea level
 }
 
@@ -63,7 +64,7 @@ AIR_COMPOSITION = {
 def get_element_properties(symbol_or_z):
     """Returns Z, Symbol for a given input."""
     # Maps for common elements
-    sym_to_z = {"Mo":42, "Pb":82, "Cu":29, "W":74, "Ag":47, "Al":13, "N":7, "O":8, "Ar":18, "Fe":26, "Au":79}
+    sym_to_z = {"Mo":42, "Pb":82, "Cu":29, "W":74, "Ag":47, "Al":13, "N":7, "O":8, "Ar":18, "Fe":26, "Au":79, "Sn":50}
     z_to_sym = {v: k for k, v in sym_to_z.items()}
     
     if str(symbol_or_z).isdigit():
@@ -84,6 +85,8 @@ def get_mixture_attenuation(energy_axis, components, att_df):
     Computes effective mu/rho for a mixture.
     components: dict {Z: weight_fraction}
     """
+    mu_mix = np.zeros_like(energy_axis)
+    mu_en_mix = np.zeros_like(energy_axis)
     mu_mix = np.zeros_like(energy_axis, dtype=float)
     mu_en_mix = np.zeros_like(energy_axis, dtype=float)
     
@@ -116,7 +119,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
     frac_accept = (1.0 - math.cos(theta)) / 2.0
     
     # 2. Material Properties
-    if material == "Air":
+    if material.lower() == "air":
         density = DENSITIES["Air"]
         mu_tot, _ = get_mixture_attenuation(E_in, AIR_COMPOSITION, att_df)
         # We typically skip fluorescence for Air in radiography as it's negligible/isotropic noise
@@ -127,6 +130,8 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         calc_fluorescence = False 
     else:
         z, sym = get_element_properties(material)
+        if z is None:
+            raise ValueError(f"Unknown material or element: '{material}'. Please check spelling or update lookup tables.")
         density = DENSITIES.get(sym, 1.0)
         
         # Get Attenuation
@@ -143,20 +148,36 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                 try:
                     df_edpl = pd.read_csv(candidates[0])
                     # Check for required columns
-                    if 'E_keV' in df_edpl.columns and 'tauK_over_rho_cm2_per_g' in df_edpl.columns:
-                        tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl['tauK_over_rho_cm2_per_g'], left=0, right=0)
-                except Exception:
-                    pass
+                    tau_col = None
+                    if 'tauK_over_rho_cm2_per_g' in df_edpl.columns:
+                        tau_col = 'tauK_over_rho_cm2_per_g'
+                    else:
+                        # Look for subshell_MT534 (K-shell)
+                        for c in df_edpl.columns:
+                            if c.startswith('subshell_MT534'):
+                                tau_col = c
+                                break
+
+                    if 'E_keV' in df_edpl.columns and tau_col:
+                        tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl[tau_col], left=0, right=0)
+                    else:
+                        print(f"Warning: EPDL file for Z={z} ({candidates[0]}) missing required columns.")
+                except Exception as e:
+                    print(f"Warning: Failed to parse EPDL file for Z={z}: {e}")
+            else:
+                print(f"Warning: No EPDL data found for Z={z} in '{edpl_folder}'. Fluorescence calculation will be inaccurate (tauK=0).")
 
         # Fluorescence Parameters
         fl_params = {
-            42: {'yield': 0.765, 'Ka': 17.48, 'Kb': 19.61}, # Mo
-            82: {'yield': 0.963, 'Ka': 74.97, 'Kb': 84.94}, # Pb
-            74: {'yield': 0.94,  'Ka': 59.32, 'Kb': 67.24}, # W
-            29: {'yield': 0.44,  'Ka': 8.05,  'Kb': 8.90},  # Cu
-            26: {'yield': 0.32,  'Ka': 6.40,  'Kb': 7.06},  # Fe
-            47: {'yield': 0.83,  'Ka': 22.16, 'Kb': 24.94}, # Ag
-            79: {'yield': 0.96,  'Ka': 68.80, 'Kb': 77.98}, # Au
+            13: {'yield': 0.039, 'Ka': 1.49,  'Kb': 1.55,  'Kb_ratio': 0.02}, # Al
+            26: {'yield': 0.32,  'Ka': 6.40,  'Kb': 7.06,  'Kb_ratio': 0.12}, # Fe
+            29: {'yield': 0.44,  'Ka': 8.05,  'Kb': 8.90,  'Kb_ratio': 0.13}, # Cu
+            42: {'yield': 0.765, 'Ka': 17.48, 'Kb': 19.61, 'Kb_ratio': 0.17}, # Mo
+            47: {'yield': 0.83,  'Ka': 22.16, 'Kb': 24.94, 'Kb_ratio': 0.18}, # Ag
+            50: {'yield': 0.84,  'Ka': 25.27, 'Kb': 28.48, 'Kb_ratio': 0.19}, # Sn
+            74: {'yield': 0.94,  'Ka': 59.32, 'Kb': 67.24, 'Kb_ratio': 0.21}, # W
+            79: {'yield': 0.96,  'Ka': 68.80, 'Kb': 77.98, 'Kb_ratio': 0.22}, # Au
+            82: {'yield': 0.963, 'Ka': 74.97, 'Kb': 84.94, 'Kb_ratio': 0.22}, # Pb
         }
         
         if z in fl_params:
@@ -164,9 +185,11 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
             fluorescence_yield = f_data['yield']
             E_Ka = f_data['Ka']
             E_Kb = f_data['Kb']
+            kb_ratio = f_data.get('Kb_ratio', 0.12)
         else:
             fluorescence_yield = 0.0
             E_Ka, E_Kb = 0.0, 0.0
+            kb_ratio = 0.12
              
     # 3. Attenuation Calculation
     t_cm = thickness_mm / 10.0
@@ -197,8 +220,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         
         # Beam-directed emission (Geometric fraction)
         if total_emission > 0:
-            # K-alpha / K-beta split (approx 0.12 ratio Kbeta/Kalpha)
-            kb_ratio = 0.12
+            # K-alpha / K-beta split
             br_ka = 1.0 / (1.0 + kb_ratio)
             br_kb = 1.0 - br_ka
             
