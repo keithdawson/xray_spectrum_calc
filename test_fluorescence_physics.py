@@ -69,11 +69,12 @@ class TestFluorescencePhysics(unittest.TestCase):
         phi_in[idx_15] = 1.0e6 
         
         # Geometry: Large acceptance to ensure we'd see it if it were there
-        geom = {'radius_mm': 100, 'distance_mm': 100} 
+        # 45 degree half-angle -> 90 degree full angle
+        geom = {'beam_angle_deg': 90.0}
         
         # Run calculation
         # Thickness 0.01 mm
-        phi_out = process_single_layer(
+        phi_out, _, _ = process_single_layer(
             self.E_kev, phi_in, 'Mo', 0.01, self.att_df, self.edpl_folder, geom
         )
         
@@ -100,12 +101,12 @@ class TestFluorescencePhysics(unittest.TestCase):
         phi_in[idx_30] = 1.0e6
         
         # Geometry: "Half sphere" acceptance (2pi steradians)
-        # theta = atan(10000/1) ~ 90 deg. frac ~ 0.5
-        geom = {'radius_mm': 10000, 'distance_mm': 1} 
+        # theta = 90 deg half-angle -> 180 deg full angle. frac ~ 0.5
+        geom = {'beam_angle_deg': 180.0}
         
         # Run calculation
         # Thickness 0.001 mm (very thin to minimize self-absorption complexity)
-        phi_out = process_single_layer(
+        phi_out, _, _ = process_single_layer(
             self.E_kev, phi_in, 'Mo', 0.001, self.att_df, self.edpl_folder, geom
         )
         

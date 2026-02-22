@@ -49,6 +49,27 @@ def plot_spectrum(csv_files):
 
             # Plot
             plt.plot(x, y, label=f"{os.path.basename(csv_file)}\n(Fluence: {total_fluence:.5e}, Pwr: {total_power_watts:.5e} W)", alpha=0.7)
+            
+            # Check for associated fluorescence file (_flouro.csv)
+            if csv_file.lower().endswith('.csv'):
+                fluoro_file = csv_file[:-4] + '_flouro.csv'
+            else:
+                fluoro_file = csv_file + '_flouro.csv'
+            
+            if os.path.exists(fluoro_file) and fluoro_file not in csv_files:
+                try:
+                    df_f = pd.read_csv(fluoro_file)
+                    x_f = df_f[df_f.columns[0]].values
+                    y_f = df_f[df_f.columns[1]].values
+                    
+                    # Calculate stats for fluoro
+                    total_fluence_f = np.sum(y_f * np.gradient(x_f))
+                    
+                    # Plot with dashed line
+                    plt.plot(x_f, y_f, linestyle='--', alpha=0.7, 
+                             label=f"{os.path.basename(fluoro_file)}\n(Fluence: {total_fluence_f:.5e})")
+                except Exception:
+                    pass # Ignore errors reading fluoro file
         except Exception as e:
             print(f"Error reading {csv_file}: {e}")
 

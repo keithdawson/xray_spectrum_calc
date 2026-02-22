@@ -9,7 +9,7 @@ Usage:
       --thickness-mm 0.10 \
       [--edpl-folder ./] \
       [--attenuation attenuation_coefficients_long.csv] \
-      [--acceptance-radius-mm 1.0] [--distance-mm 100.0] \
+      [--beam-angle-deg 30.0] \
       [--kbeta_ratio 0.12] \
       [--out out_spectrum_after_filter.csv]
 
@@ -21,9 +21,9 @@ Description:
   (K-alpha and K-beta) emitted by the filter that are traveling mostly along the same path
   as the incident beam.
 
-  The acceptance of fluoresced photons into the "same path" is modeled as a cone defined by
-  acceptance_radius_mm at a distance distance_mm. The fraction of isotropic emission inside
-  that cone is: fraction = (1 - cos(theta)) / 2 with theta = arctan(radius / distance).
+  The acceptance of fluoresced photons into the "same path" is modeled based on the
+  source beam cone angle. The fraction of isotropic emission inside that cone is:
+  fraction = (1 - cos(theta)) / 2 with theta = beam_angle / 2.
 
 Notes:
   - Script expects mass attenuation coefficients in cm^2/g and thickness in mm.
@@ -115,7 +115,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
 
     # 1. Geometry factor (Solid Angle Fraction)
     # Omega / 4pi = (1 - cos(theta)) / 2
-    theta = math.atan2(geom_params['radius_mm'], geom_params['distance_mm'])
+    theta = math.radians(geom_params['beam_angle_deg'] / 2.0)
     frac_accept = (1.0 - math.cos(theta)) / 2.0
     
     # 2. Material Properties
@@ -203,49 +203,53 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
     phi_fluorescence = np.zeros_like(phi_in)
     
     if calc_fluorescence and fluorescence_yield > 0:
-        # P_absorption = 1 - exp(-mu * rho * t)
-        prob_abs = 1.0 - transmission_factor
+        # K-alpha / K-beta split
+        br_ka = 1.0 / (1.0 + kb_ratio)
+        br_kb = 1.0 - br_ka
         
-        # Fraction of interactions that are photoelectric K-shell
-        # Note: Avoid divide by zero
-        with np.errstate(divide='ignore', invalid='ignore'):
-            frac_K_shell = np.where(mu_tot > 0, tauK_eff / mu_tot, 0.0)
+        # Attenuation at fluorescence energies
+        mu_Ka = np.interp(E_Ka, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+        mu_Kb = np.interp(E_Kb, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
         
-        # Rate of vacancy creation
-        vacancies = phi_in * prob_abs * frac_K_shell
-        
-        # Total isotropic emission
-        trapz = getattr(np, 'trapezoid', np.trapz)
-        total_emission = trapz(vacancies, E_in) * fluorescence_yield
-        
-        # Beam-directed emission (Geometric fraction)
-        if total_emission > 0:
-            # K-alpha / K-beta split
-            br_ka = 1.0 / (1.0 + kb_ratio)
-            br_kb = 1.0 - br_ka
-            
-            # Self-absorption (Escape Probability)
-            mu_Ka = np.interp(E_Ka, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
-            mu_Kb = np.interp(E_Kb, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
-            
-            def get_esc(mu, rt):
-                val = mu * rt
-                if val < 1e-5: return 1.0
-                return (1.0 - np.exp(-val)) / val
-            
-            esc_Ka = get_esc(mu_Ka, rho_t)
-            esc_Kb = get_esc(mu_Kb, rho_t)
-            
-            # Add to bins (convert total counts to density by dividing by dE)
-            idx_Ka = (np.abs(E_in - E_Ka)).argmin()
-            idx_Kb = (np.abs(E_in - E_Kb)).argmin()
-            
-            phi_fluorescence[idx_Ka] += (total_emission * br_ka * frac_accept * esc_Ka) / dE[idx_Ka]
-            phi_fluorescence[idx_Kb] += (total_emission * br_kb * frac_accept * esc_Kb) / dE[idx_Kb]
+        def calculate_fluorescence_escape(mu_in, mu_out, thickness):
+            denom = mu_out - mu_in
+            mask = np.isclose(denom, 0.0, atol=1e-7)
+            res = np.zeros_like(mu_in)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                term = (np.exp(-mu_in * thickness) - np.exp(-mu_out * thickness)) / denom
+                res[~mask] = term[~mask]
+            if np.any(mask):
+                res[mask] = thickness * np.exp(-mu_in[mask] * thickness)
+            return res
 
-    return phi_transmitted + phi_fluorescence
+        # Calculate transfer factors (vectorized over E_in)
+        transfer_Ka = calculate_fluorescence_escape(mu_tot, mu_Ka, rho_t)
+        transfer_Kb = calculate_fluorescence_escape(mu_tot, mu_Kb, rho_t)
+        
+        # Calculate escaping flux density (before integration)
+        flux_Ka = phi_in * tauK_eff * transfer_Ka
+        flux_Kb = phi_in * tauK_eff * transfer_Kb
+        
+        # Integrate
+        trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
+        total_Ka = trapz(flux_Ka, E_in)
+        total_Kb = trapz(flux_Kb, E_in)
+        
+        # Apply yield, branching, geometry
+        photons_Ka = total_Ka * fluorescence_yield * br_ka * frac_accept
+        photons_Kb = total_Kb * fluorescence_yield * br_kb * frac_accept
+        
+        # Add to bins
+        idx_Ka = (np.abs(E_in - E_Ka)).argmin()
+        idx_Kb = (np.abs(E_in - E_Kb)).argmin()
+        
+        phi_fluorescence[idx_Ka] += photons_Ka / dE[idx_Ka]
+        phi_fluorescence[idx_Kb] += photons_Kb / dE[idx_Kb]
 
-def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, out_path):
+    phi_total = phi_transmitted + phi_fluorescence
+    return phi_total, phi_fluorescence, transmission_factor
+
+def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, out_path, save_fluorescence=False):
     """
     Processes a spectrum through a stack of filters.
 
@@ -256,6 +260,7 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         edpl_folder (str): Path to the folder with EPDL-extracted data.
         geom_params (dict): Dictionary with geometry parameters ('radius_mm', 'distance_mm').
         out_path (str): Path for the output CSV file.
+        save_fluorescence (bool): If True, saves a separate CSV with only the fluorescence component.
     """
     try:
         df = pd.read_csv(spectrum_csv)
@@ -274,6 +279,9 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     E = df['Energy_KeV'].values
     Phi = df['Photons_per_s'].values
     
+    # Track accumulated fluorescence if requested
+    Phi_fluoro_accum = np.zeros_like(Phi) if save_fluorescence else None
+    
     try:
         att_df = pd.read_csv(att_file)
     except FileNotFoundError:
@@ -291,7 +299,11 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         thick = float(f['thickness'])
         
         print(f"Applying filter: {mat} ({thick} mm)...")
-        Phi = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
+        Phi, Phi_new_fluoro, trans_factor = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
+        
+        if save_fluorescence:
+            # Attenuate existing fluorescence and add new fluorescence
+            Phi_fluoro_accum = Phi_fluoro_accum * trans_factor + Phi_new_fluoro
         
         print(f"  > Photon Count after {mat}: {np.sum(Phi * dE):.2e}")
 
@@ -299,6 +311,16 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     out_df = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi})
     out_df.to_csv(out_path, index=False)
     print(f"Wrote final spectrum to {out_path}")
+    
+    if save_fluorescence:
+        if out_path.lower().endswith('.csv'):
+            out_path_fluoro = out_path[:-4] + '_flouro.csv'
+        else:
+            out_path_fluoro = out_path + '_flouro.csv'
+            
+        out_df_f = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_fluoro_accum})
+        out_df_f.to_csv(out_path_fluoro, index=False)
+        print(f"Wrote fluorescence spectrum to {out_path_fluoro}")
 
 # ---------------------------
 # CLI
@@ -333,10 +355,10 @@ Example Usage:
     p.add_argument('--edpl-folder', default='pyne_edpl', help='Folder with EPDL-extracted CSV files for fluorescence.')
     
     # Geometry args
-    p.add_argument('--acceptance-radius-mm', type=float, default=10.0, help='Acceptance cone radius at detector (mm).')
-    p.add_argument('--distance-mm', type=float, default=100.0, help='Distance from the filter stack to the detector (mm).')
+    p.add_argument('--beam-angle-deg', type=float, default=30.0, help='Full beam cone angle (degrees).')
 
     p.add_argument('--out', default='final_spectrum.csv', help='Output CSV file path.')
+    p.add_argument('--save-fluorescence', action='store_true', help='Save a separate CSV with only the fluorescence component (_flouro.csv).')
     
     args = p.parse_args()
 
@@ -350,8 +372,9 @@ Example Usage:
 
     # --- Geom Params ---
     geom_params = {
-        'radius_mm': args.acceptance_radius_mm,
-        'distance_mm': args.distance_mm
+        'radius_mm': 0.0, # Placeholder, as beam_angle_deg is now used
+        'distance_mm': 0.0, # Placeholder, as beam_angle_deg is now used
+        'beam_angle_deg': args.beam_angle_deg
     }
     
     # --- Run ---
@@ -361,7 +384,8 @@ Example Usage:
         att_file=args.attenuation,
         edpl_folder=args.edpl_folder,
         geom_params=geom_params,
-        out_path=args.out
+        out_path=args.out,
+        save_fluorescence=args.save_fluorescence
     )
 
 if __name__ == '__main__':
