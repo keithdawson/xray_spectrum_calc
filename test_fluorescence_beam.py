@@ -8,7 +8,7 @@ import subprocess
 
 # Import from the main script
 try:
-    import apply_filter_and_flourescence as aff
+    import apply_filter_and_fluorescence as aff
 except ImportError:
     print("Error: Could not import apply_filter_and_flourescence.py. Make sure it is in the current directory.")
     sys.exit(1)

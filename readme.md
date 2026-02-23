@@ -12,12 +12,12 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 
 ## Scripts & Usage
 
-### 1. Main Calculator (`apply_filter_and_flourescence.py`)
+### 1. Main Calculator (`apply_filter_and_fluorescence.py`)
 The core script. Takes an input spectrum, applies a stack of filters, calculates attenuation and fluorescence, and outputs the resulting spectrum.
 
 **Usage:**
 ```bash
-python apply_filter_and_flourescence.py \
+python apply_filter_and_fluorescence.py \
   --spectrum 225_W_spekpy_output.csv \
   --filter-materials Mo Al Air \
   --filter-thicknesses-mm 0.25 0.5 1000 \

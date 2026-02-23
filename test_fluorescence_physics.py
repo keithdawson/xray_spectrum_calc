@@ -8,7 +8,7 @@ import sys
 # Ensure we can import the module from the current directory
 sys.path.append(os.getcwd())
 try:
-    from apply_filter_and_flourescence import process_single_layer
+    from apply_filter_and_fluorescence import process_single_layer
 except ImportError:
     # Fallback if running from a different directory structure
     pass
