@@ -43,15 +43,15 @@ import pandas as pd
 
 # --- Constants & Lookup ---
 DENSITIES = {
-    "Mo": 10.28,
-    "Pb": 11.34,
-    "Cu": 8.96,
     "Al": 2.70,
     "Fe": 7.87,
-    "W": 19.25,
+    "Cu": 8.96,
+    "Mo": 10.28,
     "Ag": 10.49,
-    "Au": 19.32,
     "Sn": 7.31,
+    "W": 19.25,
+    "Au": 19.32,
+    "Pb": 11.34,
     "Air": 0.001225  # g/cm^3 at sea level
 }
 
@@ -64,7 +64,10 @@ AIR_COMPOSITION = {
 def get_element_properties(symbol_or_z):
     """Returns Z, Symbol for a given input."""
     # Maps for common elements
-    sym_to_z = {"Mo":42, "Pb":82, "Cu":29, "W":74, "Ag":47, "Al":13, "N":7, "O":8, "Ar":18, "Fe":26, "Au":79, "Sn":50}
+    sym_to_z = {
+        "N": 7, "O": 8, "Al": 13, "Ar": 18, "Fe": 26, "Cu": 29,
+        "Mo": 42, "Ag": 47, "Sn": 50, "W": 74, "Au": 79, "Pb": 82
+    }
     z_to_sym = {v: k for k, v in sym_to_z.items()}
     
     if str(symbol_or_z).isdigit():
