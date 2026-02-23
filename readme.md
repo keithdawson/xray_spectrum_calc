@@ -8,7 +8,7 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 - **Filter Attenuation**: Calculates transmission through multiple layers of materials (Mo, Al, Cu, Sn, etc.).
 - **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam.
 - **EPDL Integration**: Uses extracted EPDL (Evaluated Photon Data Library) data for accurate photoelectric cross-sections.
-- **Geometry Awareness**: Models fluorescence acceptance based on a detector geometry (solid angle).
+- **Geometry Awareness**: Models fluorescence acceptance based on the source beam cone angle.
 
 ## Scripts & Usage
 
@@ -21,7 +21,8 @@ python apply_filter_and_flourescence.py \
   --spectrum 225_W_spekpy_output.csv \
   --filter-materials Mo Al Air \
   --filter-thicknesses-mm 0.25 0.5 1000 \
-  --out filtered_spectrum.csv
+  --out filtered_spectrum.csv \
+  --save-fluorescence
 ```
 
 ### 2. Plotting (`plot_csv.py`)
