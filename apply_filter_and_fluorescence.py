@@ -38,21 +38,108 @@ import sys
 import numpy as np
 import pandas as pd
 
+from fluorescence_k_data import FLUOR_K, ATOMIC_MASS
+
+AVOGADRO = 6.02214076e23
+
 # ---------------------------
 # small density lookup (add other elements if you need)
 
 # --- Constants & Lookup ---
 DENSITIES = {
-    "Al": 2.70,
-    "Fe": 7.87,
+    "H": 8.375e-05,
+    "He": 0.0001663,
+    "Li": 0.534,
+    "Be": 1.848,
+    "B": 2.37,
+    "C": 1.7,
+    "N": 0.001165,
+    "O": 0.001332,
+    "F": 0.00158,
+    "Ne": 0.0008385,
+    "Na": 0.971,
+    "Mg": 1.74,
+    "Al": 2.699,
+    "Si": 2.33,
+    "P": 2.2,
+    "S": 2.0,
+    "Cl": 0.002995,
+    "Ar": 0.001662,
+    "K": 0.862,
+    "Ca": 1.55,
+    "Sc": 2.989,
+    "Ti": 4.54,
+    "V": 6.11,
+    "Cr": 7.18,
+    "Mn": 7.44,
+    "Fe": 7.874,
+    "Co": 8.9,
+    "Ni": 8.902,
     "Cu": 8.96,
-    "Mo": 10.28,
-    "Ag": 10.49,
+    "Zn": 7.133,
+    "Ga": 5.904,
+    "Ge": 5.323,
+    "As": 5.73,
+    "Se": 4.5,
+    "Br": 0.007072,
+    "Kr": 0.003478,
+    "Rb": 1.532,
+    "Sr": 2.54,
+    "Y": 4.469,
+    "Zr": 6.506,
+    "Nb": 8.57,
+    "Mo": 10.22,
+    "Tc": 11.5,
+    "Ru": 12.41,
+    "Rh": 12.41,
+    "Pd": 12.02,
+    "Ag": 10.5,
+    "Cd": 8.65,
+    "In": 7.31,
     "Sn": 7.31,
-    "W": 19.25,
+    "Sb": 6.691,
+    "Te": 6.24,
+    "I": 4.93,
+    "Xe": 0.005485,
+    "Cs": 1.873,
+    "Ba": 3.5,
+    "La": 6.154,
+    "Ce": 6.657,
+    "Pr": 6.71,
+    "Nd": 6.9,
+    "Pm": 7.22,
+    "Sm": 7.46,
+    "Eu": 5.243,
+    "Gd": 7.9,
+    "Tb": 8.229,
+    "Dy": 8.55,
+    "Ho": 8.795,
+    "Er": 9.066,
+    "Tm": 9.321,
+    "Yb": 6.73,
+    "Lu": 9.84,
+    "Hf": 13.31,
+    "Ta": 16.65,
+    "W": 19.3,
+    "Re": 21.02,
+    "Os": 22.57,
+    "Ir": 22.42,
+    "Pt": 21.45,
     "Au": 19.32,
-    "Pb": 11.34,
-    "Air": 0.001225  # g/cm^3 at sea level
+    "Hg": 13.55,
+    "Tl": 11.72,
+    "Pb": 11.35,
+    "Bi": 9.747,
+    "Po": 9.32,
+    "At": 10.0,
+    "Rn": 0.009066,
+    "Fr": 10.0,
+    "Ra": 5.0,
+    "Ac": 10.07,
+    "Th": 11.72,
+    "Pa": 15.37,
+    "U": 18.95,
+    "Air": 0.001225
 }
 
 AIR_COMPOSITION = {
@@ -61,21 +148,42 @@ AIR_COMPOSITION = {
     18: 0.013  # Argon (Approximation)
 }
 
+SYM_TO_Z = {
+    "H": 1, "He": 2, "Li": 3, "Be": 4, "B": 5, "C": 6, "N": 7, "O": 8, "F": 9, "Ne": 10,
+    "Na": 11, "Mg": 12, "Al": 13, "Si": 14, "P": 15, "S": 16, "Cl": 17, "Ar": 18, "K": 19, "Ca": 20,
+    "Sc": 21, "Ti": 22, "V": 23, "Cr": 24, "Mn": 25, "Fe": 26, "Co": 27, "Ni": 28, "Cu": 29, "Zn": 30,
+    "Ga": 31, "Ge": 32, "As": 33, "Se": 34, "Br": 35, "Kr": 36, "Rb": 37, "Sr": 38, "Y": 39, "Zr": 40,
+    "Nb": 41, "Mo": 42, "Tc": 43, "Ru": 44, "Rh": 45, "Pd": 46, "Ag": 47, "Cd": 48, "In": 49, "Sn": 50,
+    "Sb": 51, "Te": 52, "I": 53, "Xe": 54, "Cs": 55, "Ba": 56, "La": 57, "Ce": 58, "Pr": 59, "Nd": 60,
+    "Pm": 61, "Sm": 62, "Eu": 63, "Gd": 64, "Tb": 65, "Dy": 66, "Ho": 67, "Er": 68, "Tm": 69, "Yb": 70,
+    "Lu": 71, "Hf": 72, "Ta": 73, "W": 74, "Re": 75, "Os": 76, "Ir": 77, "Pt": 78, "Au": 79, "Hg": 80,
+    "Tl": 81, "Pb": 82, "Bi": 83, "Po": 84, "At": 85, "Rn": 86, "Fr": 87, "Ra": 88, "Ac": 89, "Th": 90,
+    "Pa": 91, "U": 92,
+}
+
+# Elements commercially available as thin foils/sheets/discs suitable for
+# physical beam filters. Excludes gases, liquids, reactive alkali/alkaline
+# earth metals, brittle metalloids (Si, Ge, Sb, Te), metals too brittle to
+# roll into foil (Cr, Mn, Ru, Os, Ir), highly toxic soft metals (Tl), and
+# radioactive elements. Rare earths Sm-Yb are included since they are sold
+# as foils and commonly used as K-edge filters (K-edges 47-63 keV).
+PRACTICAL_FILTER_MATERIALS = [
+    'Be', 'C', 'Mg', 'Al', 'Ti', 'V', 'Fe', 'Co', 'Ni', 'Cu', 'Zn',
+    'Zr', 'Nb', 'Mo', 'Rh', 'Pd', 'Ag', 'Cd', 'In', 'Sn',
+    'Sm', 'Gd', 'Tb', 'Dy', 'Ho', 'Er', 'Tm', 'Yb',
+    'Hf', 'Ta', 'W', 'Re', 'Pt', 'Au', 'Pb', 'Bi',
+]
+
 def get_element_properties(symbol_or_z):
     """Returns Z, Symbol for a given input."""
-    # Maps for common elements
-    sym_to_z = {
-        "N": 7, "O": 8, "Al": 13, "Ar": 18, "Fe": 26, "Cu": 29,
-        "Mo": 42, "Ag": 47, "Sn": 50, "W": 74, "Au": 79, "Pb": 82
-    }
-    z_to_sym = {v: k for k, v in sym_to_z.items()}
+    z_to_sym = {v: k for k, v in SYM_TO_Z.items()}
     
     if str(symbol_or_z).isdigit():
         z = int(symbol_or_z)
         return z, z_to_sym.get(z, "Unknown")
     else:
         sym = str(symbol_or_z).capitalize()
-        return sym_to_z.get(sym, None), sym
+        return SYM_TO_Z.get(sym, None), sym
 
 def load_data(edpl_folder, attenuation_csv):
     """Loads EPDL files and attenuation master list."""
@@ -107,8 +215,40 @@ def get_mixture_attenuation(energy_axis, components, att_df):
         
     return mu_mix, mu_en_mix
 
-def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_folder, 
-                        geom_params, calc_fluorescence=True):
+def calculate_fluorescence_escape(mu_in, mu_out, rho_t):
+    """Depth-integrated escape factor for secondary photons generated
+    uniformly along the beam path: integral over mass depth x of
+    exp(-mu_in*x) * exp(-mu_out*(rho_t - x)) dx, in g/cm^2. mu_in is the
+    attenuation at the exciting energy, mu_out at the outgoing energy."""
+    mu_in = np.asarray(mu_in, dtype=float)
+    denom = mu_out - mu_in
+    mask = np.isclose(denom, 0.0, atol=1e-7)
+    res = np.zeros_like(mu_in)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        term = (np.exp(-mu_in * rho_t) - np.exp(-mu_out * rho_t)) / denom
+        res[~mask] = np.broadcast_to(term, res.shape)[~mask]
+    if np.any(mask):
+        res[mask] = rho_t * np.exp(-mu_in[mask] * rho_t)
+    return res
+
+def klein_nishina_incoherent_mu(E_keV, z):
+    """Free-electron Klein-Nishina incoherent mass attenuation (cm^2/g).
+    Fallback when no EPDL incoherent data (MT504) is available. Accurate to
+    a few percent above ~30 keV; overestimates at lower energies where
+    electron binding suppresses Compton scattering."""
+    k = np.asarray(E_keV, dtype=float) / 511.0
+    two_pi_re2 = 4.989345e-25  # 2*pi*r_e^2 [cm^2]
+    ln_term = np.log(1.0 + 2.0 * k)
+    sigma_e = two_pi_re2 * (
+        (1.0 + k) / k**2 * (2.0 * (1.0 + k) / (1.0 + 2.0 * k) - ln_term / k)
+        + ln_term / (2.0 * k)
+        - (1.0 + 3.0 * k) / (1.0 + 2.0 * k)**2
+    )
+    electrons_per_g = AVOGADRO * z / ATOMIC_MASS[z]
+    return sigma_e * electrons_per_g
+
+def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_folder,
+                        geom_params, calc_fluorescence=True, calc_scatter=True):
     """
     Processes one layer of material.
     geom_params: dict with 'radius_mm', 'distance_mm'
@@ -126,11 +266,15 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         density = DENSITIES["Air"]
         mu_tot, _ = get_mixture_attenuation(E_in, AIR_COMPOSITION, att_df)
         # We typically skip fluorescence for Air in radiography as it's negligible/isotropic noise
-        # unless specific K-lines of Ar are required.
-        tauK_eff = np.zeros_like(E_in) 
+        # unless specific K-lines of Ar are required. Scatter is also skipped:
+        # the air column scatters along the whole beam path rather than acting
+        # as a localized secondary source at the filter plane.
+        tauK_eff = np.zeros_like(E_in)
         fluorescence_yield = 0.0
         elem_att = None
-        calc_fluorescence = False 
+        mu_incoh = np.zeros_like(E_in)
+        calc_fluorescence = False
+        calc_scatter = False
     else:
         z, sym = get_element_properties(material)
         if z is None:
@@ -141,12 +285,14 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         elem_att = att_df[att_df['Element'] == z]
         mu_tot = np.interp(E_in, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
         
-        # Get Fluorescence Data (EPDL) if needed
+        # Get Fluorescence & Scatter Data (EPDL) if needed
         tauK_eff = np.zeros_like(E_in)
+        mu_incoh = None
         if edpl_folder:
             # Try to find file ZA{z:03d}*.csv
             p = Path(edpl_folder)
             candidates = list(p.glob(f"*ZA{z:03d}*.csv"))
+            candidates = [c for c in candidates if 'metadata' not in c.name.lower()]
             if candidates:
                 try:
                     df_edpl = pd.read_csv(candidates[0])
@@ -165,33 +311,33 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                         tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl[tau_col], left=0, right=0)
                     else:
                         print(f"Warning: EPDL file for Z={z} ({candidates[0]}) missing required columns.")
+
+                    if 'E_keV' in df_edpl.columns and 'MT504' in df_edpl.columns:
+                        mu_incoh = np.interp(E_in, df_edpl['E_keV'], df_edpl['MT504'])
                 except Exception as e:
                     print(f"Warning: Failed to parse EPDL file for Z={z}: {e}")
             else:
                 print(f"Warning: No EPDL data found for Z={z} in '{edpl_folder}'. Fluorescence calculation will be inaccurate (tauK=0).")
 
-        # Fluorescence Parameters
-        fl_params = {
-            13: {'yield': 0.039, 'Ka': 1.49,  'Kb': 1.55,  'Kb_ratio': 0.02}, # Al
-            26: {'yield': 0.32,  'Ka': 6.40,  'Kb': 7.06,  'Kb_ratio': 0.12}, # Fe
-            29: {'yield': 0.44,  'Ka': 8.05,  'Kb': 8.90,  'Kb_ratio': 0.13}, # Cu
-            42: {'yield': 0.765, 'Ka': 17.48, 'Kb': 19.61, 'Kb_ratio': 0.17}, # Mo
-            47: {'yield': 0.83,  'Ka': 22.16, 'Kb': 24.94, 'Kb_ratio': 0.18}, # Ag
-            50: {'yield': 0.84,  'Ka': 25.27, 'Kb': 28.48, 'Kb_ratio': 0.19}, # Sn
-            74: {'yield': 0.94,  'Ka': 59.32, 'Kb': 67.24, 'Kb_ratio': 0.21}, # W
-            79: {'yield': 0.96,  'Ka': 68.80, 'Kb': 77.98, 'Kb_ratio': 0.22}, # Au
-            82: {'yield': 0.963, 'Ka': 74.97, 'Kb': 84.94, 'Kb_ratio': 0.22}, # Pb
-        }
-        
-        if z in fl_params:
-            f_data = fl_params[z]
+        if mu_incoh is None:
+            mu_incoh = klein_nishina_incoherent_mu(E_in, z)
+
+        # Fluorescence Parameters (Krause yields, rad-rate-weighted line
+        # energies; see generate_fluorescence_data.py)
+        if z in FLUOR_K:
+            f_data = FLUOR_K[z]
             fluorescence_yield = f_data['yield']
             E_Ka = f_data['Ka']
             E_Kb = f_data['Kb']
             kb_ratio = f_data.get('Kb_ratio', 0.12)
         else:
-            fluorescence_yield = 0.0
-            E_Ka, E_Kb = 0.0, 0.0
+            # Fallback empirical formulas
+            # K-shell yield: approx Z^4 / (33^4 + Z^4)
+            fluorescence_yield = float(z**4) / (33**4 + z**4)
+            # Moseley's Law: E = 10.2 eV * (Z - 1)^2 for K-alpha
+            E_Ka = 0.0102 * (z - 1)**2
+            # K-beta is roughly 12-15% higher than K-alpha
+            E_Kb = E_Ka * 1.12
             kb_ratio = 0.12
              
     # 3. Attenuation Calculation
@@ -213,17 +359,6 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         # Attenuation at fluorescence energies
         mu_Ka = np.interp(E_Ka, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
         mu_Kb = np.interp(E_Kb, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
-        
-        def calculate_fluorescence_escape(mu_in, mu_out, thickness):
-            denom = mu_out - mu_in
-            mask = np.isclose(denom, 0.0, atol=1e-7)
-            res = np.zeros_like(mu_in)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                term = (np.exp(-mu_in * thickness) - np.exp(-mu_out * thickness)) / denom
-                res[~mask] = term[~mask]
-            if np.any(mask):
-                res[mask] = thickness * np.exp(-mu_in[mask] * thickness)
-            return res
 
         # Calculate transfer factors (vectorized over E_in)
         transfer_Ka = calculate_fluorescence_escape(mu_tot, mu_Ka, rho_t)
@@ -249,8 +384,19 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         phi_fluorescence[idx_Ka] += photons_Ka / dE[idx_Ka]
         phi_fluorescence[idx_Kb] += photons_Kb / dE[idx_Kb]
 
-    phi_total = phi_transmitted + phi_fluorescence
-    return phi_total, phi_fluorescence, transmission_factor
+    # 5. Compton (incoherent) Scatter Fog
+    # Incoherent scatter in the filter is a distributed secondary source,
+    # just like fluorescence. Approximations: scattered photons keep their
+    # energy (Compton loss is <16% below 100 keV for scatter angles up to
+    # 90 deg) and are emitted isotropically (Klein-Nishina is actually
+    # forward-peaked, so the in-cone fraction is a mild underestimate).
+    phi_scatter = np.zeros_like(phi_in)
+    if calc_scatter:
+        transfer_scatter = calculate_fluorescence_escape(mu_tot, mu_tot, rho_t)
+        phi_scatter = phi_in * mu_incoh * transfer_scatter * frac_accept
+
+    phi_total = phi_transmitted + phi_fluorescence + phi_scatter
+    return phi_total, phi_fluorescence, phi_scatter, transmission_factor
 
 def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, out_path, save_fluorescence=False):
     """
@@ -268,7 +414,7 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     try:
         df = pd.read_csv(spectrum_csv)
     except FileNotFoundError:
-        sys.exit(f"Error: Input spectrum file not found at '{spectrum_csv}'")
+        raise ValueError(f"Error: Input spectrum file not found at '{spectrum_csv}'")
 
     # Be flexible with input column names
     if 'Energy_KeV' not in df.columns and 'Energy_keV' in df.columns:
@@ -277,18 +423,19 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         df = df.rename(columns={'Relative_Intensity': 'Photons_per_s'})
 
     if 'Energy_KeV' not in df.columns or 'Photons_per_s' not in df.columns:
-        sys.exit("Error: Input CSV must have columns like 'Energy_KeV' and 'Photons_per_s' or 'Energy_keV' and 'Relative_Intensity'")
+        raise ValueError("Error: Input CSV must have columns like 'Energy_KeV' and 'Photons_per_s' or 'Energy_keV' and 'Relative_Intensity'")
 
     E = df['Energy_KeV'].values
     Phi = df['Photons_per_s'].values
     
-    # Track accumulated fluorescence if requested
+    # Track accumulated fluorescence and scatter if requested
     Phi_fluoro_accum = np.zeros_like(Phi) if save_fluorescence else None
+    Phi_scatter_accum = np.zeros_like(Phi) if save_fluorescence else None
     
     try:
         att_df = pd.read_csv(att_file)
     except FileNotFoundError:
-        sys.exit(f"Error: Attenuation file not found at '{att_file}'")
+        raise ValueError(f"Error: Attenuation file not found at '{att_file}'")
 
     # Handle energy units (MeV vs KeV) in attenuation file
     if 'Energy_MeV' in att_df.columns and 'Energy_KeV' not in att_df.columns:
@@ -302,11 +449,12 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         thick = float(f['thickness'])
         
         print(f"Applying filter: {mat} ({thick} mm)...")
-        Phi, Phi_new_fluoro, trans_factor = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
-        
+        Phi, Phi_new_fluoro, Phi_new_scatter, trans_factor = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
+
         if save_fluorescence:
-            # Attenuate existing fluorescence and add new fluorescence
+            # Attenuate existing secondary components and add new ones
             Phi_fluoro_accum = Phi_fluoro_accum * trans_factor + Phi_new_fluoro
+            Phi_scatter_accum = Phi_scatter_accum * trans_factor + Phi_new_scatter
         
         print(f"  > Photon Count after {mat}: {np.sum(Phi * dE):.2e}")
 
@@ -316,14 +464,15 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     print(f"Wrote final spectrum to {out_path}")
     
     if save_fluorescence:
-        if out_path.lower().endswith('.csv'):
-            out_path_fluoro = out_path[:-4] + '_fluoro.csv'
-        else:
-            out_path_fluoro = out_path + '_fluoro.csv'
-            
+        base = out_path[:-4] if out_path.lower().endswith('.csv') else out_path
+
         out_df_f = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_fluoro_accum})
-        out_df_f.to_csv(out_path_fluoro, index=False)
-        print(f"Wrote fluorescence spectrum to {out_path_fluoro}")
+        out_df_f.to_csv(base + '_fluoro.csv', index=False)
+        print(f"Wrote fluorescence spectrum to {base + '_fluoro.csv'}")
+
+        out_df_s = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_scatter_accum})
+        out_df_s.to_csv(base + '_scatter.csv', index=False)
+        print(f"Wrote scatter spectrum to {base + '_scatter.csv'}")
 
 # ---------------------------
 # CLI
@@ -367,7 +516,7 @@ Example Usage:
 
     # --- Parse Filters ---
     if len(args.filter_materials) != len(args.filter_thicknesses_mm):
-        sys.exit("Error: The number of materials and thicknesses must be the same.")
+        raise ValueError("Error: The number of materials and thicknesses must be the same.")
 
     filter_stack = []
     for material, thickness in zip(args.filter_materials, args.filter_thicknesses_mm):

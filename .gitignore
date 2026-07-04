@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+
+# Per-user app state
+.last_filters.json
+.material_settings.json
+
+# Regenerable caches and script outputs
+emission_opt_results_*.csv
+validation_results.csv
+test_out*.csv
+_tmp_*.csv
+
+# Packaging build artifacts (regenerate with package_*.ps1)
+deploy_windows/
+deploy_linux/
+deploy_windows.zip
+deploy_linux.tar.gz

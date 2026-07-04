@@ -86,7 +86,7 @@ def extract_file(path):
     row = MASS_ATTEN[MASS_ATTEN["Z"] == Z]
     if row.empty:
         raise RuntimeError(f"Z={Z} not found in mass_atten.csv")
-    atomic_mass = float(row["Z/A"].values[0]) * Z   # g/mol
+    atomic_mass = Z / float(row["Z/A"].values[0])   # g/mol
     density = float(row["Density (g/cm3)"].values[0])
 
     components = {}

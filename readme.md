@@ -7,8 +7,16 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 
 - **Filter Attenuation**: Calculates transmission through multiple layers of materials (Mo, Al, Cu, Sn, etc.).
 - **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam.
+- **Compton Scatter Fog**: Models incoherent scatter from the filters as a secondary extended source (same cone-acceptance geometry as fluorescence), using EPDL incoherent cross-sections with a Klein-Nishina fallback.
 - **EPDL Integration**: Uses extracted EPDL (Evaluated Photon Data Library) data for accurate photoelectric cross-sections.
 - **Geometry Awareness**: Models fluorescence acceptance based on the source beam cone angle.
+
+## Project Goals & CT Physics
+
+This tool is specifically tailored toward optimizing X-ray beam profiles for **Computed Tomography (CT) scanning** of high-density electronics (e.g., heavily populated PCBs containing FR4, Copper, Tin, and Lead). The physical modeling revolves around two major optimizations:
+
+1. **Beam Hardening for Contrast**: Raw tungsten emissions contain too many soft X-rays, which lack the energy to penetrate dense solder components (Tin/Lead) and result in detector saturation without adding useful contrast. This app uses complex filter stacks to mathematically "harden" the beam, ensuring enough high-energy photons penetrate the board to maximize the contrast of the critical elements (e.g., differentiating Copper traces from FR4 substrate) without widening the detector histogram unnecessarily.
+2. **Minimizing Secondary Fluorescence (Focal Spot Sharpness)**: In CT, image sharpness is governed by the size of the X-ray focal spot. When a filter is placed in the beam path, it absorbs X-rays and re-emits isotropic **fluorescence**. This effectively turns the entire illuminated area of the filter into a massive, blurry secondary X-ray source. The application explicitly models this scattering physics: the primary focal-spot beam acts as static *Fluence* against a central pixel, while the secondary fluorescence dynamically scales with the physical collimator (cone) angle. By isolating these components, the user can visually and mathematically optimize the filter stack to minimize this destructive secondary glow.
 
 ## Scripts & Usage
 
@@ -46,20 +54,21 @@ Converts SpekPy output (often irregular bins) into the standard CSV format used 
 python convert_spekpy.py
 ```
 
-### 4. Data Generation (`generate_master_attenuation.py`)
-Compiles individual element attenuation CSVs (extracted from NIST HTML) into a single master lookup file.
+### 4. Attenuation Data Generation (`extract_atten_coeff/regenerate_master_from_nist.py`)
+Regenerates `attenuation_coefficients_long.csv` (all 92 elements) directly from the local NIST XrayMassCoef HTML mirror in `physics.nist.gov/`. Uses log-log interpolation between NIST anchor energies (mu/rho follows a power law, so linear interpolation overestimates by up to ~10% in the sparse 60-300 keV region) and preserves absorption edges as sharp steps at their true energies.
 
 **Usage:**
 ```bash
-python generate_master_attenuation.py
+python extract_atten_coeff/regenerate_master_from_nist.py
 ```
 
-### 5. HTML Scraper (`convert_html_tables_to_csv.py`)
-Parses NIST HTML files in the `extract_atten_coeff` folder to create individual CSVs for `generate_master_attenuation.py`. Handles absorption edge steps by creating infinitesimal energy increments.
+### 5. Fluorescence Data Generation (`generate_fluorescence_data.py`)
+Regenerates `fluorescence_k_data.py`: K-shell fluorescence yields (Krause 1979), rad-rate-weighted K-alpha/K-beta line energies, and branching ratios for Z=11-92, extracted from `xraylib`. Only needed to refresh the data module; the app does not require xraylib at runtime.
 
 **Usage:**
 ```bash
-python convert_html_tables_to_csv.py
+pip install xraylib
+python generate_fluorescence_data.py
 ```
 
 ## Testing
@@ -93,10 +102,11 @@ python test_fluorescence_beam.py
 
 ## Data Sources
 
-- **Attenuation**: NIST X-ray Mass Attenuation Coefficients (scraped from local HTML files).
-- **Fluorescence Data**: EPDL (Evaluated Photon Data Library) extracted CSVs located in `pyne_edpl/`.
+- **Attenuation**: NIST X-ray Mass Attenuation Coefficients (regenerated from the local HTML mirror with log-log interpolation and exact edge steps; see `extract_atten_coeff/regenerate_master_from_nist.py`).
+- **Cross-sections** (`pyne_edpl/ZA*.csv`): K-shell photoionization (Scofield) and incoherent scatter, generated from xraylib on a 0.1 keV grid with sharp K-edge onsets for Z=11-92 (`generate_fluorescence_xs.py`). These replaced the original coarse-grid EPDL extracts; both derive from Scofield's calculations and agree to <1%.
+- **Fluorescence lines** (`fluorescence_k_data.py`): Krause (1979) K yields, rad-rate-weighted line energies and branching ratios from xraylib (`generate_fluorescence_data.py`).
 
 ## Folder Structure
 
-- `pyne_edpl/`: Contains extracted EPDL data (cross-sections).
-- `extract_atten_coeff/`: Contains NIST HTML files and generation scripts.
+- `pyne_edpl/`: Per-element cross-section CSVs (see Data Sources).
+- `extract_atten_coeff/`: NIST HTML mirror extraction and master-table generation scripts.

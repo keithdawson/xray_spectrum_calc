@@ -1,0 +1,16 @@
+Z,Density_g_cm3,MT,Label,Binding_eV,Fluorescence_yield,Points
+19,0.862,501,total_interaction,,,6474
+19,0.862,502,MT502,,,431
+19,0.862,504,MT504,,,385
+19,0.862,515,MT515,,,211
+19,0.862,516,MT516,,,450
+19,0.862,517,MT517,,,296
+19,0.862,522,photoelectric_total,,,5332
+19,0.862,534,subshell_MT534_3.61keV,3610.0,,562
+19,0.862,535,subshell_MT535_0.38keV,381.0,,644
+19,0.862,536,subshell_MT536_0.30keV,299.0,,745
+19,0.862,537,subshell_MT537_0.30keV,296.0,,744
+19,0.862,538,subshell_MT538_0.04keV,37.0,,709
+19,0.862,539,subshell_MT539_0.02keV,19.0,,911
+19,0.862,540,subshell_MT540_0.02keV,18.7,,914
+19,0.862,543,subshell_MT543_0.00keV,4.34,,916
