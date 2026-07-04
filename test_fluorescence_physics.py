@@ -156,6 +156,7 @@ class TestFluorescencePhysics(unittest.TestCase):
         if os.path.exists(spec_file): os.remove(spec_file)
         if os.path.exists(out_file): os.remove(out_file)
         if os.path.exists('test_out_fluoro.csv'): os.remove('test_out_fluoro.csv')
+        if os.path.exists('test_out_scatter.csv'): os.remove('test_out_scatter.csv')
 
 if __name__ == '__main__':
     unittest.main()

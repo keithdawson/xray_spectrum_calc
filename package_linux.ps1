@@ -28,6 +28,9 @@ Copy-Item "emission_optimizer.py" -Destination $DeployDir -Force
 Copy-Item "test_fluorescence_physics.py" -Destination $DeployDir -Force
 Copy-Item "*.csv" -Destination $DeployDir -Force
 Copy-Item "pyne_edpl" -Destination $DeployDir -Recurse -Force
+# Raw ENDF source files and metadata are not read at runtime
+Remove-Item "$DeployDir\pyne_edpl\*.txt" -Force -ErrorAction SilentlyContinue
+Remove-Item "$DeployDir\pyne_edpl\*_metadata.csv" -Force -ErrorAction SilentlyContinue
 Copy-Item "install_and_run.sh" -Destination $DeployDir -Force
 Copy-Item "requirements.txt" -Destination $DeployDir -Force
 
