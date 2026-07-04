@@ -5,11 +5,11 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 
 ## Features
 
-- **Filter Attenuation**: Calculates transmission through multiple layers of materials (Mo, Al, Cu, Sn, etc.).
-- **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam.
-- **Compton Scatter Fog**: Models incoherent scatter from the filters as a secondary extended source (same cone-acceptance geometry as fluorescence), using EPDL incoherent cross-sections with a Klein-Nishina fallback.
-- **EPDL Integration**: Uses extracted EPDL (Evaluated Photon Data Library) data for accurate photoelectric cross-sections.
-- **Geometry Awareness**: Models fluorescence acceptance based on the source beam cone angle.
+- **Filter Attenuation**: Calculates transmission through multiple layers of materials (all elements Z=1-92, NIST data with exact absorption-edge steps).
+- **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam, for any filter element Z=11-92 (Scofield K-shell cross-sections, Krause yields, weighted line energies).
+- **Compton Scatter Fog**: Models incoherent scatter from the filters as a secondary extended source (same cone-acceptance geometry as fluorescence), using binding-corrected incoherent cross-sections with a Klein-Nishina fallback.
+- **Geometry Awareness**: Models secondary-radiation acceptance based on the source beam cone angle.
+- **CT Context**: Target contrast analysis with scintillator energy deposition weighted by mu_en/mu (accounts for Compton and K-escape losses in Gadox/CsI), plus three filter optimizers.
 
 ## Project Goals & CT Physics
 
@@ -18,10 +18,28 @@ This tool is specifically tailored toward optimizing X-ray beam profiles for **C
 1. **Beam Hardening for Contrast**: Raw tungsten emissions contain too many soft X-rays, which lack the energy to penetrate dense solder components (Tin/Lead) and result in detector saturation without adding useful contrast. This app uses complex filter stacks to mathematically "harden" the beam, ensuring enough high-energy photons penetrate the board to maximize the contrast of the critical elements (e.g., differentiating Copper traces from FR4 substrate) without widening the detector histogram unnecessarily.
 2. **Minimizing Secondary Fluorescence (Focal Spot Sharpness)**: In CT, image sharpness is governed by the size of the X-ray focal spot. When a filter is placed in the beam path, it absorbs X-rays and re-emits isotropic **fluorescence**. This effectively turns the entire illuminated area of the filter into a massive, blurry secondary X-ray source. The application explicitly models this scattering physics: the primary focal-spot beam acts as static *Fluence* against a central pixel, while the secondary fluorescence dynamically scales with the physical collimator (cone) angle. By isolating these components, the user can visually and mathematically optimize the filter stack to minimize this destructive secondary glow.
 
+## Interactive App (`app.py`)
+
+The primary interface — a Streamlit app wrapping the physics engine:
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+- **Spectrum input**: generate with SpekPy (kVp, anode angle/material, 0.1 keV default bins) or load/upload a CSV.
+- **Filter stack editor**: reorderable material + thickness rows, persisted between sessions (`.last_filters.json`).
+- **Results**: power/flux at the DUT with run-over-run deltas, fluorescence and Compton scatter power shown separately (increases flagged red — more fog is bad), log-scale and display-rebinning chart controls, CSV downloads for all three components.
+- **Material selection** (⚙️ Materials): choose which foil elements the dropdowns and optimizers use, from a curated list of 36 practically-purchasable materials; persisted in `.material_settings.json`.
+- **Optimizers**: Cascading Fluorescence (secondary filter to absorb the primary's fluorescence), CNR Filter (penetration vs contrast under shadowing), Emission Line (isolate W K-lines >= 57 keV). Each has one-click "Apply" buttons to push results into the filter stack.
+- **Contrast analysis**: energy deposited in the scintillator through Target A vs Target B, with the |A-B| difference trace showing where the contrast comes from.
+
+Offline installers for machines without internet can be built with `package_windows.ps1` / `package_linux.ps1` (bundles Python + wheels into `deploy_windows/` / `deploy_linux/`).
+
 ## Scripts & Usage
 
 ### 1. Main Calculator (`apply_filter_and_fluorescence.py`)
-The core script. Takes an input spectrum, applies a stack of filters, calculates attenuation and fluorescence, and outputs the resulting spectrum.
+The core script. Takes an input spectrum, applies a stack of filters, calculates attenuation, fluorescence, and Compton scatter, and outputs the resulting spectrum. With `--save-fluorescence` it also writes the isolated secondary components (`*_fluoro.csv`, `*_scatter.csv`).
 
 **Usage:**
 ```bash
@@ -63,12 +81,21 @@ python extract_atten_coeff/regenerate_master_from_nist.py
 ```
 
 ### 5. Fluorescence Data Generation (`generate_fluorescence_data.py`)
-Regenerates `fluorescence_k_data.py`: K-shell fluorescence yields (Krause 1979), rad-rate-weighted K-alpha/K-beta line energies, and branching ratios for Z=11-92, extracted from `xraylib`. Only needed to refresh the data module; the app does not require xraylib at runtime.
+Regenerates `fluorescence_k_data.py`: K-shell fluorescence yields (Krause 1979), rad-rate-weighted K-alpha/K-beta line energies, branching ratios, and atomic masses for Z=11-92, extracted from `xraylib`. Only needed to refresh the data module; the app does not require xraylib at runtime.
 
 **Usage:**
 ```bash
 pip install xraylib
 python generate_fluorescence_data.py
+```
+
+### 6. Cross-Section Generation (`generate_fluorescence_xs.py`)
+Regenerates the per-element files in `pyne_edpl/` (K-shell photoionization `tauK` and incoherent scatter `MT504`) from xraylib on a 0.1 keV grid with sharp K-edge onsets, for Z=11-92.
+
+**Usage:**
+```bash
+pip install xraylib
+python generate_fluorescence_xs.py
 ```
 
 ## Testing
