@@ -6,7 +6,7 @@ import shutil
 import math
 from apply_filter_and_fluorescence import (
     process_single_layer, run_stack, DENSITIES, calculate_fluorescence_escape,
-    fluorescence_cone_escape,
+    fluorescence_cone_escape, acceptance_cone_from_geometry, resolve_acceptance_angle_deg,
 )
 from fluorescence_k_data import FLUOR_K
 from spectrum_utils import energy_bin_widths, integrate_spectrum, interpolate_attenuation, add_line_density
@@ -234,6 +234,26 @@ class TestFluorescencePhysics(unittest.TestCase):
         if os.path.exists(out_file): os.remove(out_file)
         if os.path.exists('test_out_fluoro.csv'): os.remove('test_out_fluoro.csv')
         if os.path.exists('test_out_scatter.csv'): os.remove('test_out_scatter.csv')
+
+    def test_acceptance_cone_from_physical_geometry(self):
+        # D = 2*L -> half-angle = 45 deg -> full angle = 90 deg
+        self.assertAlmostEqual(acceptance_cone_from_geometry(100.0, 200.0), 90.0, places=9)
+        self.assertAlmostEqual(acceptance_cone_from_geometry(100.0, 0.0), 0.0, places=9)
+        self.assertAlmostEqual(
+            resolve_acceptance_angle_deg({'filter_to_detector_mm': 100.0, 'detector_diameter_mm': 200.0}),
+            90.0, places=9
+        )
+        # Per-layer distance override changes the subtended cone angle
+        self.assertAlmostEqual(
+            resolve_acceptance_angle_deg(
+                {'filter_to_detector_mm': 500.0, 'detector_diameter_mm': 200.0},
+                {'filter_to_detector_mm': 100.0}
+            ),
+            90.0, places=9
+        )
+        for bad_dist, bad_diam in [(0.0, 100.0), (-5.0, 100.0), (100.0, -1.0), (np.nan, 100.0)]:
+            with self.assertRaises(ValueError):
+                acceptance_cone_from_geometry(bad_dist, bad_diam)
 
 if __name__ == '__main__':
     unittest.main()

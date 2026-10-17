@@ -78,6 +78,19 @@ class EmissionOptimizerTests(unittest.TestCase):
         self.assertNotEqual(base, optimizer._cache_path(settings, self.att_path,
                                                        ['Cu'], DENSITIES))
 
+    def test_custom_filter_materials_subset(self):
+        source = Mock()
+        source.get_spectrum.return_value = (np.array([40.0, 80.0]), np.array([3.0, 7.0]))
+        with patch.object(optimizer, 'DATA_DIR', self.folder), \
+                patch.object(optimizer.sp, 'Spek', return_value=source):
+            result = optimizer.run_emission_optimizer(
+                kvp=100, dk=40, max_thickness_mm=0.1, filter_materials=['Cu', 'Cu']
+            )
+        self.assertEqual(list(result['Filter_Material']), ['Cu'])
+        for bad_mats in ([], ['NotAnElement']):
+            with self.subTest(bad_mats=bad_mats), self.assertRaises(ValueError):
+                optimizer.run_emission_optimizer(kvp=100, dk=40, filter_materials=bad_mats)
+
 
 if __name__ == '__main__':
     unittest.main()

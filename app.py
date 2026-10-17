@@ -6,10 +6,16 @@ import os
 import tempfile
 import io
 import json
-from apply_filter_and_fluorescence import run_stack, PRACTICAL_FILTER_MATERIALS, SYM_TO_Z
+from apply_filter_and_fluorescence import (
+    run_stack,
+    PRACTICAL_FILTER_MATERIALS,
+    SYM_TO_Z,
+    acceptance_cone_from_geometry,
+)
 from bundled_data import DEFAULT_SPECTRA
 from source_spectrum import generate_spekpy_spectrum, spectrum_normalization
 from ct_physics import attenuation_exponent
+from spectrum_utils import energy_bin_widths
 
 st.set_page_config(page_title='X-ray Spectrum Calculator', layout='wide')
 
@@ -157,11 +163,48 @@ with st.container():
     top_c1, top_c2, top_c3 = st.columns([1.2, 2.0, 1.0])
     
     with top_c1:
-        st.markdown("**Beam Basics**")
+        bb_head1, bb_head2 = st.columns([1.4, 1.0])
+        bb_head1.markdown("**Beam Basics**")
+        with bb_head2.popover('📐 Cone Geometry'):
+            st.caption('Compute the secondary acceptance cone full angle from physical Filter-to-Detector distance $L$ and detector aperture diameter $D$ via $\\theta = 2\\arctan(D / 2L)$.')
+            use_phys_cone = st.checkbox(
+                'Derive Cone from Detector Geometry',
+                value=False,
+                key='use_phys_cone',
+            )
+            filter_to_det_mm = st.number_input(
+                'Filter-to-Detector Distance (mm)',
+                min_value=1.0,
+                value=500.0,
+                step=10.0,
+                format='%.1f',
+                key='filter_to_det_mm',
+                help='Distance from the filter exit plane to the detector entrance plane.',
+            )
+            det_aperture_mm = st.number_input(
+                'Detector Aperture Diameter (mm)',
+                min_value=0.1,
+                value=200.0,
+                step=10.0,
+                format='%.1f',
+                key='det_aperture_mm',
+                help='Effective active diameter or width of the detector / collimator aperture.',
+            )
+            derived_cone_deg = acceptance_cone_from_geometry(filter_to_det_mm, det_aperture_mm)
+            st.caption(f'Derived full acceptance cone: **{derived_cone_deg:.2f}°**')
         bb_c1, bb_c2 = st.columns(2)
         with bb_c1:
-            beam_angle = st.slider('Secondary Acceptance Cone (deg)', 15.0, 120.0, 30.0, step=2.0,
-                                   help='Full acceptance angle about each incident ray. This is a plane-slab estimate; it does not calculate detector coverage or focal-spot blur.')
+            if use_phys_cone:
+                beam_angle = float(derived_cone_deg)
+                st.number_input(
+                    'Secondary Acceptance Cone (deg)',
+                    value=round(beam_angle, 2),
+                    disabled=True,
+                    help='Computed automatically from Filter-to-Detector Distance and Detector Aperture Diameter in 📐 Cone Geometry.',
+                )
+            else:
+                beam_angle = st.slider('Secondary Acceptance Cone (deg)', 1.0, 180.0, 30.0, step=1.0,
+                                       help='Full acceptance angle about each incident ray, or use 📐 Cone Geometry to compute from physical filter-to-detector distance and aperture size.')
             tube_current_ma = st.number_input('Tube Current (mA)', min_value=0.001, value=1.0, step=0.1, format='%.3f',
                                               help='Used for SpekPy spectra. Generated output is photons per cm² per second.')
         with bb_c2:
@@ -338,10 +381,10 @@ with col2:
         they are already coarser than the requested bin."""
         E = np.asarray(E, dtype=float)
         phi = np.asarray(phi, dtype=float)
-        if len(E) < 3 or np.median(np.gradient(E)) >= bin_kev:
+        if len(E) < 3 or np.median(energy_bin_widths(E)) >= bin_kev:
             return E, phi
         edges = np.arange(E.min() - 1e-9, E.max() + bin_kev, bin_kev)
-        integral, _ = np.histogram(E, bins=edges, weights=phi * np.gradient(E))
+        integral, _ = np.histogram(E, bins=edges, weights=phi * energy_bin_widths(E))
         centers = 0.5 * (edges[:-1] + edges[1:])
         return centers, integral / bin_kev
 
@@ -424,7 +467,7 @@ with col2:
                     # Calculate Power at Target
                     E_out = res_df['Energy_KeV'].values
                     Phi_out = res_df['Photons_per_s'].values
-                    dE_out = np.gradient(E_out)
+                    dE_out = energy_bin_widths(E_out)
                     power_watts = np.sum(Phi_out * dE_out * E_out * 1.60218e-16)
                     total_flux = np.sum(Phi_out * dE_out)
                     
@@ -455,7 +498,7 @@ with col2:
                             if not fluoro_df.empty:
                                 f_E = fluoro_df['Energy_KeV'].values
                                 f_Phi = fluoro_df['Photons_per_s'].values
-                                f_dE = np.gradient(f_E)
+                                f_dE = energy_bin_widths(f_E)
                                 f_power = np.sum(f_Phi * f_dE * f_E * 1.60218e-16)
                                 f_flux = np.sum(f_Phi * f_dE)
                                 pct_of_total = (f_power / power_watts) * 100.0 if power_watts > 0 else 0.0
@@ -478,7 +521,7 @@ with col2:
                             if not scatter_df.empty:
                                 s_E = scatter_df['Energy_KeV'].values
                                 s_Phi = scatter_df['Photons_per_s'].values
-                                s_dE = np.gradient(s_E)
+                                s_dE = energy_bin_widths(s_E)
                                 s_power = np.sum(s_Phi * s_dE * s_E * 1.60218e-16)
                                 s_flux = np.sum(s_Phi * s_dE)
                                 s_pct_of_total = (s_power / power_watts) * 100.0 if power_watts > 0 else 0.0
@@ -571,7 +614,7 @@ with col2:
                 return f'{format_sci(value / 1.60218e-16)} keV·a.u.'
             return format_power(value) + ('/cm²' if per_area else '')
         st.caption('Generated spectra use tube current and inverse-square distance scaling. CSV downloads preserve normalization metadata. Imported spectra without metadata retain the units implied by their input column.')
-        st.caption('Secondary radiation is a plane-slab cone estimate. Detector size, filter positions, object scatter, Rayleigh scatter, L-shell emission and multiple interactions within each foil are not modeled.')
+        st.caption('Secondary radiation is a plane-slab cone estimate including K-shell fluorescence, incoherent (Compton) scatter, and coherent (Rayleigh) scatter. Object scatter, L-shell emission, and multiple interactions within each foil are not modeled.')
         cols_m = st.columns(4)
         cols_m[0].metric('Energy output at DUT' if relative else ('Power density at DUT' if per_area else 'Power at DUT'), display_power(power_watts), delta=calc_data['delta_power_str'])
         cols_m[1].metric('Photon fluence rate' if per_area else 'Integrated photon output', f"{format_sci(total_flux)} {flux_unit}", delta=calc_data['delta_flux_str'])
@@ -585,8 +628,8 @@ with col2:
             s_pct = calc_data.get('s_pct_of_total', 0.0)
             cols_s = st.columns(4)
             cols_s[0].metric('Total Secondary %', f"{(s_pct + pct_of_total):.3f}%",
-                             help="Accepted K fluorescence + Compton scatter as a fraction of modeled total energy fluence. This is a cone estimate, not a spatial blur or detector fog measurement.")
-            cols_s[2].metric('Compton scatter energy output', display_power(s_power), delta=calc_data.get('s_delta_str'), delta_color='inverse')
+                             help="Accepted K fluorescence + Compton/Rayleigh scatter as a fraction of modeled total energy fluence. This is a cone estimate, not a spatial blur or detector fog measurement.")
+            cols_s[2].metric('Scatter energy output (Compton + Rayleigh)', display_power(s_power), delta=calc_data.get('s_delta_str'), delta_color='inverse')
             cols_s[3].metric('Scatter %', f"{s_pct:.3f}%")
 
         fig = go.Figure()
@@ -611,7 +654,7 @@ with col2:
 
         if scatter_df is not None and not scatter_df.empty:
             s_x, s_y = display_xy(scatter_df['Energy_KeV'].values, scatter_df['Photons_per_s'].values)
-            fig.add_trace(go.Scatter(x=s_x, y=s_y, name='Compton Scatter', line=dict(color='orange', width=2)))
+            fig.add_trace(go.Scatter(x=s_x, y=s_y, name='Scatter (Compton + Rayleigh)', line=dict(color='orange', width=2)))
 
         x_max = float(np.nanmax(input_x)) * 1.02
 
@@ -663,19 +706,10 @@ with col2:
 
         # --- Fluorescence Optimizer ---
         with st.expander("✨ Cascading Fluorescence Optimizer", expanded=False):
-            st.caption("Automatically find the best secondary cascading filter to eliminate fluorescence (and optionally Compton scatter) fog generated by your primary filter.")
+            st.caption("Automatically find the best downstream cascading filter to eliminate fluorescence (and optionally Compton scatter) fog generated by your upstream filter stack.")
             
-            # Grab filter info from material 1 in the filter stack
-            if len(st.session_state.filters) > 0:
-                fluor_mat1 = st.session_state.filters[0]['material']
-                fluor_thick1 = st.session_state.filters[0]['thickness']
-                has_filter = True
-            else:
-                fluor_mat1 = None
-                fluor_thick1 = None
-                has_filter = False
-                
-            fluor_cols1 = st.columns([1.4, 1.2, 1.0])
+            has_filter = len(st.session_state.filters) > 0
+            fluor_cols1 = st.columns([1.6, 1.1, 1.0])
             fluor_include_scatter = fluor_cols1[1].checkbox(
                 'Include Compton Scatter Fog',
                 value=False,
@@ -683,9 +717,37 @@ with col2:
                 help='When enabled, ranks secondary filters by total secondary energy removed (K-fluorescence + Compton scatter) rather than K-fluorescence alone, preventing thick low-Z filters with heavy Compton scatter from ranking artificially high.'
             )
             if has_filter:
-                fluor_cols1[0].markdown(f"**Primary Filter (from Stack):** `{fluor_mat1}` ({fluor_thick1:.2f} mm)")
+                def _format_upstream_depth(depth):
+                    chain = " → ".join(
+                        f"{f['material']} ({f['thickness']:.2f} mm)"
+                        for f in st.session_state.filters[:depth]
+                    )
+                    label = "Layer 1" if depth == 1 else f"Layers 1–{depth}"
+                    return f"{label}: {chain}"
+
+                if len(st.session_state.filters) == 1:
+                    fluor_upstream_depth = 1
+                    fluor_cols1[0].markdown(f"**Upstream Stack:** `{_format_upstream_depth(1)}`")
+                else:
+                    fluor_upstream_depth = fluor_cols1[0].selectbox(
+                        'Optimize Behind Upstream Stack',
+                        options=list(range(1, len(st.session_state.filters) + 1)),
+                        index=0,
+                        format_func=_format_upstream_depth,
+                        key='fluor_upstream_depth_sel',
+                        help='Choose Layer 1 to optimize the second filter, or Layers 1–N to cascade a third/fourth graded-Z filter behind the existing stack.'
+                    )
+                selected_upstream = [
+                    {'material': f['material'], 'thickness': float(f['thickness'])}
+                    for f in st.session_state.filters[:fluor_upstream_depth]
+                ]
+                fluor_stack_summary = " → ".join(
+                    f"{f['material']} ({f['thickness']:.2f} mm)" for f in selected_upstream
+                )
                 fluor_opt_btn = fluor_cols1[2].button('🚀 Run Fluorescence Optimizer', type='secondary', key='run_fluor_opt_btn', width='stretch')
             else:
+                selected_upstream = []
+                fluor_stack_summary = ""
                 fluor_cols1[0].warning("⚠️ Filter stack is empty. Please add a filter to the stack first.")
                 fluor_opt_btn = False
                 
@@ -697,20 +759,24 @@ with col2:
                     df_fluor_res, top_fluor_res = ct_optimizer.run_fluorescence_optimization(
                         energies=energy,
                         raw_photons=fluence,
-                        mat1=fluor_mat1,
-                        thick1=fluor_thick1,
+                        mat1=selected_upstream[0]['material'],
+                        thick1=selected_upstream[0]['thickness'],
                         candidate_materials=list(st.session_state.enabled_materials),
                         geom_params={'beam_angle_deg': beam_angle},
                         downstream_transmission=np.exp(-attenuation_exponent('Air', energy, distance_to_target)),
                         include_scatter=fluor_include_scatter,
+                        upstream_filters=selected_upstream,
                     )
                     
                     st.session_state.fluor_opt_results = {
                         'df_fluor_res': df_fluor_res,
                         'top_fluor_res': top_fluor_res,
-                        'mat1': fluor_mat1,
+                        'mat1': selected_upstream[-1]['material'],
+                        'thick1': selected_upstream[-1]['thickness'],
+                        'upstream_filters': selected_upstream,
+                        'stack_summary': fluor_stack_summary,
+                        'insert_idx': len(selected_upstream),
                         'beam_angle': beam_angle,
-                        'thick1': fluor_thick1,
                         'include_scatter': fluor_include_scatter,
                         'candidates': list(st.session_state.enabled_materials),
                         'input_option': input_option,
@@ -722,6 +788,7 @@ with col2:
                         'tube_window': tube_window, 'tube_current_ma': tube_current_ma,
                         'source_distance_mm': distance_to_target
                     }
+                    st.session_state.fluor_applied_secondary = None
                 except Exception as e:
                     st.error(f"Fluorescence optimization failed: {e}")
                     
@@ -730,9 +797,8 @@ with col2:
                 
                 # Check if optimizer results are stale
                 fluor_stale = False
-                if (res['mat1'] != fluor_mat1 or
+                if (res.get('upstream_filters') != selected_upstream or
                     res.get('beam_angle') != beam_angle or
-                    res['thick1'] != fluor_thick1 or
                     res.get('include_scatter', False) != fluor_include_scatter or
                     res.get('candidates') != st.session_state.enabled_materials or
                     res['input_option'] != input_option or
@@ -747,17 +813,18 @@ with col2:
                     fluor_stale = True
                     
                 if fluor_stale:
-                    st.warning("⚠️ **Optimization results are out of date.** Settings or Primary Filter in Stack have changed. Click 'Run Fluorescence Optimizer' to update.")
+                    st.warning("⚠️ **Optimization results are out of date.** Settings or Upstream Filter Stack have changed. Click 'Run Fluorescence Optimizer' to update.")
                     
                 df_fluor_res = res['df_fluor_res']
                 top_fluor_res = res['top_fluor_res']
                 used_scatter = res.get('include_scatter', False)
+                summary_label = res.get('stack_summary', res['mat1'])
                 
                 if df_fluor_res.empty:
-                    st.warning("The primary filter absorbs all energy or produces no secondary radiation. No secondary filter needed.")
+                    st.warning("The upstream filter stack absorbs all energy or produces no secondary radiation. No downstream filter needed.")
                 else:
                     target_desc = "total secondary (fluorescence + scatter)" if used_scatter else "fluorescence"
-                    st.write(f"Top secondary filters to suppress {res['mat1']} {target_desc} while preserving main beam power:")
+                    st.write(f"Top cascading filters to suppress `{summary_label}` {target_desc} while preserving main beam power:")
                     
                     if used_scatter and 'Secondary_elim' in top_fluor_res.columns:
                         st.dataframe(top_fluor_res[['Filter_Material', 'Thickness_mm', 'F_elim', 'Secondary_elim', 'P_kept', 'Score']].style.format({
@@ -775,8 +842,9 @@ with col2:
                             'Score': '{:.4f}'
                         }))
 
-                    st.markdown("### 📥 Apply Secondary Filter")
-                    st.write(f"Insert a secondary filter into the stack directly behind your `{res['mat1']}` primary. Clicking another option swaps it out, so you can quickly compare candidates:")
+                    insert_idx = int(res.get('insert_idx', 1))
+                    st.markdown("### 📥 Apply Cascading Filter")
+                    st.write(f"Insert a cascading filter at **Layer {insert_idx + 1}** directly behind `{summary_label}`. Clicking another option swaps it out so you can quickly compare candidates:")
                     cols_apply_fl = st.columns(4)
                     for idx, (_, row) in enumerate(top_fluor_res.iterrows()):
                         mat = row['Filter_Material']
@@ -786,11 +854,11 @@ with col2:
                             new_secondary = {'material': mat, 'thickness': round(float(thick), 3)}
                             prev_applied = st.session_state.get('fluor_applied_secondary')
                             if (prev_applied is not None and
-                                len(st.session_state.filters) > 1 and
-                                st.session_state.filters[1] == prev_applied):
-                                st.session_state.filters[1] = new_secondary
+                                len(st.session_state.filters) > insert_idx and
+                                st.session_state.filters[insert_idx] == prev_applied):
+                                st.session_state.filters[insert_idx] = new_secondary
                             else:
-                                st.session_state.filters.insert(1, new_secondary)
+                                st.session_state.filters.insert(min(insert_idx, len(st.session_state.filters)), new_secondary)
                             st.session_state.fluor_applied_secondary = new_secondary
                             sync_filter_widget_state()
                             save_filters()
@@ -898,6 +966,24 @@ with col2:
             
             opt_cols2[3].markdown('<div style="margin-top: 28px;"></div>', unsafe_allow_html=True)
             optimize_btn = opt_cols2[3].button('🚀 Run Filter Optimizer', type='secondary', key='run_filter_opt_btn', width='stretch')
+            opt_chk1, opt_chk2 = st.columns(2)
+            opt_stack_mode = opt_chk1.checkbox(
+                'Optimize Additional Layer on Current Filter Stack',
+                value=False,
+                key='opt_stack_mode',
+                help='When checked, pre-attenuates the primary spectrum through your current Filter Stack before optimizing an additional layer, and appends the chosen filter instead of replacing the stack.'
+            )
+            opt_include_fog = opt_chk2.checkbox(
+                'Include Filter Secondary Fog (Fluorescence + Scatter) in CNR Noise',
+                value=False,
+                key='opt_include_fog',
+                help='When checked, includes unmodulated K-fluorescence and Compton/Rayleigh scatter emitted by the candidate filter within the acceptance cone in both the air-path detector load and the compound-Poisson variance.'
+            )
+            active_pre_filters = (
+                [{'material': f['material'], 'thickness': float(f['thickness'])} for f in st.session_state.filters]
+                if opt_stack_mode and len(st.session_state.filters) > 0
+                else []
+            )
             
             if optimize_btn:
                 st.info("Running Penetration vs Contrast Filter Optimizer...")
@@ -914,10 +1000,16 @@ with col2:
                             _, sym = apply_filter_and_fluorescence.get_element_properties(item)
                             if sym and sym != "Unknown":
                                 opt_custom_filters.append(sym)
+
+                    raw_photons_for_opt = fluence * np.exp(-attenuation_exponent('Air', energy, distance_to_target))
+                    for pf in active_pre_filters:
+                        raw_photons_for_opt = raw_photons_for_opt * np.exp(
+                            -attenuation_exponent(pf['material'], energy, pf['thickness'])
+                        )
                                 
                     df_opt_res, top_opt_res = ct_optimizer.run_filter_optimization(
                         energies=energy,
-                        raw_photons=fluence * np.exp(-attenuation_exponent('Air', energy, distance_to_target)),
+                        raw_photons=raw_photons_for_opt,
                         target_a_mat=target_a_mat,
                         target_a_thick=target_a_thick,
                         target_b_mat=target_b_mat,
@@ -931,7 +1023,9 @@ with col2:
                         path_multiplier=opt_path_mult,
                         time_penalty_limit=opt_time_limit,
                         extra_filters=opt_custom_filters,
-                        filter_materials=list(st.session_state.enabled_materials)
+                        filter_materials=list(st.session_state.enabled_materials),
+                        include_secondary_fog=opt_include_fog,
+                        geom_params={'beam_angle_deg': beam_angle},
                     )
                     
                     z_map = apply_filter_and_fluorescence.SYM_TO_Z
@@ -945,6 +1039,9 @@ with col2:
                         'df_opt_res': df_opt_res,
                         'top_opt_res': top_opt_res,
                         'candidates': list(st.session_state.enabled_materials),
+                        'pre_filters': active_pre_filters,
+                        'include_secondary_fog': opt_include_fog,
+                        'beam_angle': beam_angle,
                         'shadow1_mat': opt_shadow1_mat,
                         'shadow1_thick': opt_shadow1_thick,
                         'shadow2_mat': opt_shadow2_mat,
@@ -975,6 +1072,9 @@ with col2:
                 # Check if filter optimizer results are stale
                 filter_opt_stale = False
                 if (res.get('candidates') != st.session_state.enabled_materials or
+                    res.get('pre_filters', []) != active_pre_filters or
+                    res.get('include_secondary_fog', False) != opt_include_fog or
+                    (opt_include_fog and res.get('beam_angle') != beam_angle) or
                     res.get('shadow1_mat') != opt_shadow1_mat or
                     res.get('shadow1_thick') != opt_shadow1_thick or
                     res.get('shadow2_mat') != opt_shadow2_mat or
@@ -1003,33 +1103,52 @@ with col2:
                     
                 df_opt_res = res['df_opt_res']
                 top_opt_res = res['top_opt_res']
+                used_pre_filters = res.get('pre_filters', [])
+                used_fog = res.get('include_secondary_fog', False)
                 
                 st.subheader('Optimization Results')
-                st.write(f"Top filter thicknesses balancing Dynamic Contrast against detector saturation limits (Max {opt_time_limit}x Time Penalty):")
+                if used_pre_filters:
+                    pre_desc = " → ".join(f"{f['material']} ({f['thickness']:.2f} mm)" for f in used_pre_filters)
+                    st.write(f"Top additional filter thicknesses behind `{pre_desc}` (Max {opt_time_limit}x additional Time Penalty):")
+                else:
+                    st.write(f"Top filter thicknesses balancing Dynamic Contrast against detector saturation limits (Max {opt_time_limit}x Time Penalty):")
                 
+                opt_display_cols = ['Plot', 'Filter_Material', 'Thickness_mm', 'Dynamic_CNR', 'Time_Penalty']
+                opt_disabled_cols = ['Filter_Material', 'Thickness_mm', 'Dynamic_CNR', 'Time_Penalty']
+                if used_fog and 'Secondary_Fog_Pct' in top_opt_res.columns:
+                    opt_display_cols.append('Secondary_Fog_Pct')
+                    opt_disabled_cols.append('Secondary_Fog_Pct')
                 edited_top_opt_res = st.data_editor(
-                    top_opt_res[['Plot', 'Filter_Material', 'Thickness_mm', 'Dynamic_CNR', 'Time_Penalty']],
+                    top_opt_res[opt_display_cols],
                     column_config={
                         'Plot': st.column_config.CheckboxColumn('Plot', help="Select to display on the chart below"),
                         'Filter_Material': 'Material',
                         'Thickness_mm': st.column_config.NumberColumn('Thickness (mm)', format='%.2f'),
                         'Dynamic_CNR': st.column_config.NumberColumn('Normalized CNR', format='%.8f'),
-                        'Time_Penalty': st.column_config.NumberColumn('Time Penalty', format='%.1fx')
+                        'Time_Penalty': st.column_config.NumberColumn('Time Penalty', format='%.1fx'),
+                        'Secondary_Fog_Pct': st.column_config.NumberColumn('Secondary Fog (%)', format='%.2f %%'),
                     },
-                    disabled=['Filter_Material', 'Thickness_mm', 'Dynamic_CNR', 'Time_Penalty'],
+                    disabled=opt_disabled_cols,
                     hide_index=False,
                     width='stretch',
                     key='opt_data_editor'
                 )
                 st.markdown("### 📥 Apply Optimized Filter")
-                st.write("Set an optimized filter as your active filter stack (automatically enables fluorescence analysis):")
+                if used_pre_filters:
+                    st.write("Append an optimized filter layer to your pre-filtered stack:")
+                else:
+                    st.write("Set an optimized filter as your active filter stack (automatically enables fluorescence analysis):")
                 cols_apply = st.columns(4)
                 for idx, (_, row) in enumerate(edited_top_opt_res.iterrows()):
                     mat = row['Filter_Material']
                     thick = row['Thickness_mm']
                     col_idx = idx % 4
                     if cols_apply[col_idx].button(f"Apply {mat} ({thick:.2f} mm)", key=f"apply_opt_{mat}", width='stretch'):
-                        st.session_state.filters = [{'material': mat, 'thickness': round(float(thick), 3)}]
+                        new_layer = {'material': mat, 'thickness': round(float(thick), 3)}
+                        if used_pre_filters:
+                            st.session_state.filters = [f.copy() for f in used_pre_filters] + [new_layer]
+                        else:
+                            st.session_state.filters = [new_layer]
                         sync_filter_widget_state()
                         save_filters()
                         st.session_state.calculated_spectrum = None
@@ -1056,29 +1175,56 @@ with col2:
                 st.plotly_chart(fig_opt, width='stretch')
         with tab_emission:
             st.markdown("### High-Energy Fluence Optimizer")
-            st.write('Find filters that remove energy fluence below 57 keV while preserving energy fluence at and above 57 keV, including the continuum. This primary-transmission estimate excludes filter fluorescence and scatter; check candidates in the full stack calculator (up to 300 keV).')
+            st.write('Find filters that remove energy fluence below a cutoff threshold (default 57 keV for W K-lines) while preserving energy fluence at and above the threshold, including the continuum. This primary-transmission estimate excludes filter fluorescence and scatter; check candidates in the full stack calculator (up to 300 keV).')
             st.caption('Standalone tungsten source: 12° anode, 0.1-keV bins, no tube-window or air filtration. These settings are independent of the main calculator.')
             
-            e_col1, e_col2 = st.columns(2)
+            e_col1, e_col2, e_col3 = st.columns(3)
             opt_kvp = e_col1.number_input("Tube Voltage (kVp)", min_value=60, max_value=450, value=220, step=10, key='opt_em_kvp')
             opt_max_t = e_col2.number_input("Max Thickness (mm)", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key='opt_em_thick')
+            opt_em_thresh = e_col3.number_input(
+                "Energy Threshold (keV)",
+                min_value=5.0,
+                max_value=float(opt_kvp - 1),
+                value=min(57.0, float(opt_kvp - 1)),
+                step=1.0,
+                key='opt_em_thresh',
+                help="Cutoff separating the low-energy band to suppress from the high-energy band to preserve (57 keV corresponds to W K-alpha lines)."
+            )
+            opt_em_enabled_only = st.checkbox(
+                "Only Sweep Enabled Materials (⚙️ Materials)",
+                value=False,
+                key="opt_em_enabled_only",
+                help="When checked, restricts the sweep to materials checked in the ⚙️ Materials popover instead of all 36 practical filter elements."
+            )
+            em_materials = list(st.session_state.enabled_materials) if opt_em_enabled_only else None
             
             if st.button("Run High-Energy Optimizer", type="primary"):
                 with st.spinner("Sweeping practical filter materials..."):
                     try:
                         from emission_optimizer import run_emission_optimizer
-                        df_em = run_emission_optimizer(kvp=opt_kvp, max_thickness_mm=opt_max_t)
+                        df_em = run_emission_optimizer(
+                            kvp=opt_kvp,
+                            max_thickness_mm=opt_max_t,
+                            threshold_kev=opt_em_thresh,
+                            filter_materials=em_materials,
+                        )
                         st.session_state.emission_opt_results = df_em
                         st.session_state.emission_opt_kvp = opt_kvp
                         st.session_state.emission_opt_max_t = opt_max_t
+                        st.session_state.emission_opt_thresh = opt_em_thresh
+                        st.session_state.emission_opt_materials = em_materials
                     except Exception as e:
                         st.error(f"Optimization failed: {e}")
             
             if 'emission_opt_results' in st.session_state and st.session_state.emission_opt_results is not None:
-                if st.session_state.emission_opt_kvp != opt_kvp or st.session_state.emission_opt_max_t != opt_max_t:
+                if (st.session_state.emission_opt_kvp != opt_kvp or
+                    st.session_state.emission_opt_max_t != opt_max_t or
+                    st.session_state.get('emission_opt_thresh', 57.0) != opt_em_thresh or
+                    st.session_state.get('emission_opt_materials') != em_materials):
                     st.warning("⚠️ **Settings have changed.** Click 'Run High-Energy Optimizer' to update results.")
                     
                 df_em = st.session_state.emission_opt_results
+                thresh_used = st.session_state.get('emission_opt_thresh', 57.0)
                 
                 st.write("Best thickness for each material, ranked by Score = (Removed Low %) * (Kept High %)^2")
                 edited_df_em = st.data_editor(
@@ -1086,8 +1232,8 @@ with col2:
                     column_config={
                         'Filter_Material': 'Material',
                         'Thickness_mm': st.column_config.NumberColumn('Thickness (mm)', format='%.2f'),
-                        'Removed_Low_Pct': st.column_config.NumberColumn('Removed <57 keV (%)', format='%.2f %%'),
-                        'Kept_High_Pct': st.column_config.NumberColumn('Kept >=57 keV (%)', format='%.2f %%'),
+                        'Removed_Low_Pct': st.column_config.NumberColumn(f'Removed <{thresh_used:g} keV (%)', format='%.2f %%'),
+                        'Kept_High_Pct': st.column_config.NumberColumn(f'Kept >={thresh_used:g} keV (%)', format='%.2f %%'),
                         'Score': st.column_config.NumberColumn('Score', format='%.0f')
                     },
                     disabled=True,

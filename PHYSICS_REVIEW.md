@@ -12,9 +12,9 @@ experimental accuracy for detector fog, spatial resolution or absolute CT CNR.
 | Spectrum integration | Trapezoidal integration half-counted endpoint bins; some scripts used SpekPy's duplicated plotting coordinates. | Bin-centre spectra with consistent midpoint widths. All photons in the first/last bin are included. |
 | K fluorescence | Emission used normal-path escape at every angle, rounded lines to one bin, and moved out-of-grid lines to the grid boundary. | Angle-integrated oblique escape; two-bin deposition conserving photon count and energy; omitted out-of-grid lines. |
 | Atomic data | Generator caught every library error as “below edge,” yielding false zero K absorption from 300.1–500 keV. Missing K-beta caused Na/Mg to be omitted entirely. | Regenerated Z=11–92 tables over supported 1–300 keV; propagate unexpected errors; retain alpha-only emitters; preserve distinct edge anchors. |
-| Compton scatter | Isotropic, unchanged-energy secondary spectrum. | Normalized Waller–Hartree (`Klein–Nishina × S(q, Z)`) angles with small-angle binding suppression, Compton recoil energy loss, oblique escape, and conservative redistribution. Adaptive integration resolves scattered characteristic-line shapes. |
-| Detector/CNR | Optimizer treated energy signal as Poisson counts and omitted the energy-deposition weighting used by contrast analysis. | Shared detector mean and second-moment response; independent A/B noise; fixed-capacity normalization. |
-| Optimizers | Omitted downstream fluorescence cascades and no-filter/end-point choices; geometry was hardcoded. The “emission line” objective actually retained the entire high-energy band. | Cascade generation, optional Compton-scatter inclusion in secondary optimization, selected geometry, signed secondary changes, feasible boundary/no-filter candidates, support for all input spectra, and mtime-aware EPDL caching; renamed high-energy objective and corrected cache keys. |
+| Compton & Rayleigh scatter | Isotropic, unchanged-energy secondary spectrum; coherent (Rayleigh) scatter removed from primary without entering accepted secondary spectrum. | Normalized Waller–Hartree (`Klein–Nishina × S(q, Z)`) incoherent angles with small-angle binding suppression, Compton recoil energy loss, oblique escape, and conservative redistribution, plus coherent (Rayleigh) elastic scatter weighted by Hubbell relativistic atomic form factors `(1 + cos²θ) |F(q, Z)|²` and `CS_Rayl` (`MT502`). |
+| Detector/CNR | Optimizer treated energy signal as Poisson counts and omitted the energy-deposition weighting used by contrast analysis. | Shared detector mean and second-moment response; independent A/B noise; fixed-capacity normalization; optional inclusion of filter secondary fog in detector load and variance. |
+| Optimizers | Omitted downstream fluorescence cascades and no-filter/end-point choices; geometry was hardcoded. The “emission line” objective actually retained the entire high-energy band. | Multi-layer upstream cascade generation, optional scatter-fog inclusion in fluorescence and CNR optimizers, physical filter-to-detector acceptance cone calculator, pre-filtration stack mode, configurable high-energy cutoff threshold, and precomputed log-attenuation / normalizer caches. |
 | Source units | SpekPy's fluence per area was displayed as total power; selected distance only changed air absorption. | Tube-current control, inverse-square source scaling, W/cm² and photons/cm²/s labels, and persistent CSV normalization metadata. Relative spectra retain arbitrary units. |
 
 The underlying NIST attenuation master was checked against all 92 elements'
@@ -43,11 +43,17 @@ J(E, E', c) = integral from 0 to T of
 The implementation evaluates this analytically using a cancellation-resistant
 exponential difference. Isotropic fluorescence integrates `J dc/2` over the
 accepted cone and multiplies by K photoionization, fluorescence yield and line
-branching. Scatter instead weights the Klein–Nishina differential shape by the
-Waller–Hartree / Hubbell et al. (1975) atomic incoherent scattering function
-`S(q, Z)` with `q = (E / 12.3984193 keV·Å) sqrt((1-c)/2)` (normalized over
-`c in [-1, 1]` using a `s = sin(theta/2)` quadrature rule that removes the
+branching. Incoherent (Compton) scatter weights the Klein–Nishina differential
+shape by the Waller–Hartree / Hubbell et al. (1975) atomic incoherent scattering
+function `S(q, Z)` with `q = (E / 12.3984193 keV·Å) sqrt((1-c)/2)` (normalized
+over `c in [-1, 1]` using a `s = sin(theta/2)` quadrature rule that removes the
 endpoint square-root singularity) and `E' = E / [1 + E/(510.99895 keV) (1-c)]`.
+Coherent (Rayleigh) scatter is elastic (`E' = E`) and weights the unpolarized
+Thomson angular factor `0.5 (1 + c²)` by the squared relativistic Hartree–Fock
+atomic form factor `|F(q, Z)|²` (`COHERENT_FF` in `fluorescence_k_data.py`),
+scaled by the tabulated coherent mass cross-section `MT502` (`CS_Rayl` in
+`pyne_edpl/ZA*.csv`). Because `|F(q, Z)|²` is strongly forward-peaked (`F(0, Z) = Z`),
+a large fraction of Rayleigh scatter falls inside forward acceptance cones.
 Partial rates are capped against the NIST total to prevent mixed-source edge
 discrepancies creating photons. This bound is a numerical consistency measure,
 not a resolution of source-data uncertainty. The Compton relation and
@@ -83,20 +89,20 @@ Numbers below are integrated accepted photon fluence per cm² per mAs. The
 changes reflect the revised approximation; they are not measured correction
 factors for a real detector.
 
-| Foil | Fluorescence before | Fluorescence after | Scatter (isotropic) | Scatter (free-e KN) | Scatter (Waller–Hartree `S(q,Z)`) |
+| Foil | Fluorescence before | Fluorescence after | Scatter (isotropic Compton) | Scatter (Compton `S(q,Z)`) | Scatter (Compton `S(q,Z)` + Rayleigh `|F(q,Z)|²`) |
 |---|---:|---:|---:|---:|---:|
-| Cu 0.05 mm | 196,235 | 193,992 | 24,868 | 43,189 | 16,116 |
-| Mo 0.05 mm | 974,253 | 968,437 | 18,476 | 32,394 | 12,401 |
-| Ta 0.05 mm | 219,385 | 218,755 | 19,478 | 34,139 | 11,009 |
-| W 0.10 mm | 226,198 | 224,656 | 22,044 | 38,889 | 12,968 |
+| Cu 0.05 mm | 196,235 | 193,992 | 24,868 | 16,116 | 709,983 |
+| Mo 0.05 mm | 974,253 | 968,437 | 18,476 | 12,401 | 761,682 |
+| Ta 0.05 mm | 219,385 | 218,755 | 19,478 | 11,009 | 1,798,742 |
+| W 0.10 mm | 226,198 | 224,656 | 22,044 | 12,968 | 1,906,173 |
 
 Primary transmission changes by less than 0.04% in these examples. Fluorescence
-falls by approximately 0.3–1.1%. While free-electron Klein–Nishina angles would
-raise 30°-cone scatter by 74–76% (because free-electron `dσ_KN/dΩ` peaks at
-`θ = 0°`), including the Waller–Hartree atomic incoherent scattering function
-`S(q, Z)` suppresses small-angle forward incoherent scattering (`S(0, Z) = 0`),
-reducing accepted 30°-cone Compton scatter by 33–43% relative to the isotropic
-estimate and 62–68% relative to the unguarded free-electron angular shape.
+falls by approximately 0.3–1.1%. While Waller–Hartree binding (`S(0, Z) = 0`)
+suppresses forward 30°-cone incoherent Compton scatter to 11,009–16,116
+photons/cm²/mAs, coherent (Rayleigh) scatter has `F(0, Z) = Z` (`|F(0, Z)|² = Z²`),
+which strongly concentrates elastic scatter into forward angles (`θ <= 15°`) and
+makes forward-cone Rayleigh scatter a dominant component of the accepted
+scattered field, particularly for high-Z filters (`Ta`, `W`).
 
 For the detector/CNR comparison, use the same 100-kVp/12° source with 0.5-keV
 bins, FR4 1 mm versus Cu 0.035 mm, and Gadox 0.2 mm. Weber contrast changes from
@@ -123,10 +129,12 @@ lines. The Sm optimum changes from 0.09 to 0.08 mm.
 
 The automated suite covers analytic slab integrals, photon/energy conservation,
 K thresholds and tabulated support, KN/Thomson limits, Waller–Hartree `S(q, Z)`
-forward-scatter suppression and normalization, independent angular/depth
-integration, scattered-line shapes, CNR second moments/scaling, optimizer
-boundaries/cascades (including scatter-aware secondary ranking), source
-distance/current scaling and cache invalidation.
+forward-scatter suppression and normalization, Hubbell `F(q, Z)` coherent
+Rayleigh elastic scatter and normalization, independent angular/depth
+integration, scattered-line shapes, physical acceptance-cone geometry, CNR
+second moments/scaling (including secondary-fog penalties), optimizer
+boundaries/cascades (including multi-layer upstream stacks and scatter-aware
+secondary ranking), source distance/current scaling and cache invalidation.
 Both repository-required test scripts pass. Streamlit smoke runs calculate
 the saved filter stack, run both CNR and fluorescence optimizers, and load a
 relative input spectrum without errors. The app applies the selected downstream
@@ -135,12 +143,12 @@ include the new modules.
 
 For quantitative industrial-CT prediction, the next improvements should be:
 
-1. **Actual geometry and coherent (Rayleigh) scattering.** Specify source/filter/
-   object/detector positions, beam footprint, detector area and collimation.
-   Integrate accepted rays. Atomic incoherent scattering functions `S(q, Z)` are
-   now included for Compton scatter, but Rayleigh scattering (`F(q, Z)`) is
-   still removed from the primary without being added to the accepted secondary
-   field.
+1. **Full 2D/3D spatial transport and collimation.** The plane-slab cone
+   calculator now supports deriving acceptance angle from filter-to-detector
+   distance and aperture diameter, and includes both incoherent (`S(q, Z)`) and
+   coherent (`F(q, Z)`) scatter, but still treats accepted secondaries as a 1D
+   spectral sum rather than a 2D spatial point-spread / glare distribution across
+   the detector plane.
 2. **Finite-detector response and measured noise.** Use screen packing density,
    optical response, event-level energy-deposition moments, fluorescence
    reabsorption/escape and measured gain/noise. The present variance can be too
@@ -155,7 +163,7 @@ For quantitative industrial-CT prediction, the next improvements should be:
    tails. Differences between databases are particularly sensitive near edges.
    [NIST database comparison](https://www.nist.gov/pml/note-nist-x-ray-attenuation-databases)
 
-These follow-ups need physical geometry, detector characterization or an
+These follow-ups need 2D spatial transport, detector characterization or an
 independent transport reference. The application now describes its supported
 approximation explicitly rather than treating spectra alone as a prediction of
 spatial blur or reconstructed image quality.

@@ -101,6 +101,17 @@ def main():
         lines.append(f'    {z}: ({sf_vals},),  # {sym}')
     lines.append('}')
     lines.append('')
+    lines.append('# Atomic coherent (Rayleigh) form factor F(q, Z) in (0, Z] (Hubbell et al. 1975)')
+    lines.append('COHERENT_FF = {')
+    for z in range(1, 93):
+        sym = xraylib.AtomicNumberToSymbol(z)
+        raw_ff = [float(f'{xraylib.FF_Rayl(z, float(q)):.6g}') for q in q_grid]
+        # Enforce monotonically nonincreasing F(q, Z) <= Z across the grid.
+        monotonic_ff = np.maximum(np.minimum.accumulate(np.minimum(raw_ff, float(z))), 1e-30)
+        ff_vals = ', '.join(f'{float(v):.6g}' for v in monotonic_ff)
+        lines.append(f'    {z}: ({ff_vals},),  # {sym}')
+    lines.append('}')
+    lines.append('')
 
     with open(Path(__file__).resolve().with_name('fluorescence_k_data.py'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))

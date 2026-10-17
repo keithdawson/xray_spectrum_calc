@@ -7,9 +7,9 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 
 - **Filter Attenuation**: Calculates transmission through multiple layers of materials (all elements Z=1-92, NIST data with exact absorption-edge steps).
 - **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam, for any filter element Z=11-92 (Kissel K-shell cross-sections, Krause yields, weighted line energies; 1–300 keV).
-- **Compton Scatter**: Single-collision transport with Waller–Hartree (`Klein–Nishina × S(q, Z)`) angular weighting, Compton energy loss and oblique escape. Uses binding-corrected total cross-sections and Hubbell atomic incoherent scattering functions to account for small-angle forward binding suppression.
-- **Acceptance Geometry**: Integrates secondary radiation over a specified forward cone through a plane slab. This is a directional acceptance parameter, not a detector geometry or focal-spot blur calculation.
-- **CT Context**: Shared NIST target attenuation and an idealized first-interaction scintillator response weighted by mu_en/mu. CNR uses energy-weighted compound-Poisson variance. Finite-screen escape/reabsorption and detector noise require further validation.
+- **Compton & Rayleigh Scatter**: Single-collision transport combining incoherent (Compton) scatter with Waller–Hartree (`Klein–Nishina × S(q, Z)`) angular weighting and Compton recoil energy loss, plus coherent (Rayleigh) elastic scatter weighted by Hubbell relativistic atomic form factors `(1 + cos²θ) |F(q, Z)|²` and `CS_Rayl` (`MT502`).
+- **Acceptance Geometry**: Integrates secondary radiation over a specified forward cone through a plane slab, specified either directly in degrees or computed from physical filter-to-detector distance and detector aperture diameter (`--filter-to-detector-mm` / `--detector-diameter-mm` or the `📐 Cone Geometry` calculator).
+- **CT Context**: Shared NIST target attenuation and an idealized first-interaction scintillator response weighted by mu_en/mu. CNR uses energy-weighted compound-Poisson variance (with optional inclusion of filter secondary fog). Finite-screen escape/reabsorption and detector noise require further validation.
 
 ## Project Goals & CT Physics
 
@@ -26,9 +26,9 @@ Spectra contain densities at strictly increasing positive energy-bin centres. In
 
 Generated app spectra use tube current in mA and source distance in mm, returning photons/cm²/s/keV. Power is W/cm². Air attenuation is applied separately. Imported spectra retain their normalization: `Photons_per_s` defaults to photons/s/keV; `Relative_Intensity` is arbitrary units. Exported `Normalization` metadata records this distinction.
 
-The attenuation table covers 1–500 keV. The regenerated Z=11–92 K-shell and incoherent tables cover 1–300 keV; the full secondary model is supported in that range. Requests outside table support raise errors instead of silently extrapolating. Photoionization data are Kissel partial cross-sections, not Scofield. Low-Z high-energy tails and mixed-source differences near edges still require independent benchmarking.
+The attenuation table covers 1–500 keV. The regenerated Z=1–92 coherent (`MT502`) and incoherent (`MT504`) scatter tables and Z=11–92 K-shell (`tauK`) tables cover 1–300 keV; the full secondary model is supported in that range. Requests outside table support raise errors instead of silently extrapolating. Photoionization data are Kissel partial cross-sections, not Scofield. Low-Z high-energy tails and mixed-source differences near edges still require independent benchmarking.
 
-The cone accepts downstream directions only (full angle 0–180 degrees). Secondary rays propagate axially between layers; intra-layer re-interactions, L/M fluorescence, Rayleigh additions, object scatter and air-generated secondaries are omitted. Lines shifted outside the represented centre range leave the calculation.
+The cone accepts downstream directions only (full angle 0–180 degrees). Secondary rays propagate axially between layers; intra-layer re-interactions, L/M fluorescence, object scatter and air-generated secondaries are omitted. Lines shifted outside the represented centre range leave the calculation.
 
 ## Interactive App (`app.py`)
 
@@ -41,9 +41,9 @@ streamlit run app.py
 
 - **Spectrum input**: generate with SpekPy (kVp, anode angle/material, 0.1 keV default bins) or load/upload a CSV.
 - **Filter stack editor**: reorderable material + thickness rows, persisted between sessions (`.last_filters.json`).
-- **Results**: power/flux at the DUT with run-over-run deltas, fluorescence and Compton scatter power shown separately (increases flagged red — more fog is bad), log-scale and display-rebinning chart controls, CSV downloads for all three components.
+- **Results**: power/flux at the DUT with run-over-run deltas, fluorescence and scatter (Compton + Rayleigh) power shown separately (increases flagged red — more fog is bad), log-scale and display-rebinning chart controls, CSV downloads for all three components.
 - **Material selection** (⚙️ Materials): choose which foil elements the dropdowns and optimizers use, from a curated list of 36 practically-purchasable materials; persisted in `.material_settings.json`.
-- **Optimizers**: Cascading Fluorescence (secondary filter to absorb the primary's fluorescence, with optional Compton scatter fog inclusion), CNR Filter (penetration vs contrast under shadowing), High-Energy Fluence (preserve the entire band >= 57 keV, including continuum). Work with any input spectrum and include one-click "Apply" buttons to push results into the filter stack.
+- **Optimizers**: Cascading Fluorescence (multi-layer graded-Z secondary filter optimization to absorb upstream fluorescence and optional scatter fog), CNR Filter (penetration vs contrast under shadowing, with optional pre-filtration stack mode and secondary-fog noise penalty), High-Energy Fluence (preserve the entire band above a configurable threshold, default 57 keV). Work with any input spectrum and include one-click "Apply" buttons to push results into the filter stack.
 - **Contrast analysis**: energy deposited in the scintillator through Target A vs Target B, compound-Poisson CNR per √exposure, and the |A-B| difference trace showing where the contrast comes from.
 
 Offline installers for machines without internet can be built with `package_windows.ps1` / `package_linux.ps1` (bundles Python + wheels into `deploy_windows/` / `deploy_linux/`).

@@ -21,7 +21,7 @@ from functools import lru_cache
 
 import numpy as np
 
-from fluorescence_k_data import INCOHERENT_SF, INCOHERENT_SF_Q
+from fluorescence_k_data import COHERENT_FF, INCOHERENT_SF, INCOHERENT_SF_Q
 
 
 ELECTRON_REST_ENERGY_KEV = 510.99895
@@ -45,6 +45,20 @@ def _element_sf_table(atomic_number):
     sf.setflags(write=False)
     log_sf.setflags(write=False)
     return z, sf, log_sf
+
+
+@lru_cache(maxsize=96)
+def _element_ff_table(atomic_number):
+    if (not isinstance(atomic_number, (int, np.integer))
+            or isinstance(atomic_number, bool)
+            or int(atomic_number) not in COHERENT_FF):
+        raise ValueError(f"Unsupported atomic number for coherent scattering: {atomic_number!r}")
+    z = int(atomic_number)
+    ff = np.asarray(COHERENT_FF[z], dtype=float)
+    log_ff = np.log(ff)
+    ff.setflags(write=False)
+    log_ff.setflags(write=False)
+    return z, ff, log_ff
 
 
 def compton_momentum_transfer(energy_keV, cos_theta):
@@ -85,6 +99,38 @@ def incoherent_scattering_function(atomic_number, q_inv_angstrom):
     if np.any(mid):
         result[mid] = np.minimum(
             np.exp(np.interp(np.log(q_arr[mid]), _LOG_SF_Q_GRID, log_sf_grid)),
+            float(z),
+        )
+    return float(result[0]) if scalar_input else result.reshape(q.shape)
+
+
+def coherent_form_factor(atomic_number, q_inv_angstrom):
+    """Evaluate Hubbell et al. (1975) coherent atomic form factor F(q, Z) in (0, Z].
+
+    Uses quadratic behavior F(q, Z) = Z - (Z - F(q_min, Z)) * (q / q_min)^2 below
+    0.005 1/Angstrom so F(0, Z) = Z with zero slope at q = 0, log-log
+    interpolation on [0.005, 50] 1/Angstrom, and (q_max / q)^2 tail decay above
+    50 1/Angstrom.
+    """
+    z, ff_grid, log_ff_grid = _element_ff_table(atomic_number)
+    q = np.asarray(q_inv_angstrom, dtype=float)
+    if np.any(~np.isfinite(q)) or np.any(q < 0):
+        raise ValueError("Momentum transfer q must be finite and nonnegative.")
+    scalar_input = q.ndim == 0
+    q_arr = np.atleast_1d(q)
+    result = np.empty_like(q_arr, dtype=float)
+    q_min = _SF_Q_GRID[0]
+    q_max = _SF_Q_GRID[-1]
+    low = q_arr < q_min
+    high = q_arr >= q_max
+    mid = ~(low | high)
+    if np.any(low):
+        result[low] = float(z) - (float(z) - ff_grid[0]) * (q_arr[low] / q_min) ** 2
+    if np.any(high):
+        result[high] = ff_grid[-1] * (q_max / q_arr[high]) ** 2
+    if np.any(mid):
+        result[mid] = np.minimum(
+            np.exp(np.interp(np.log(q_arr[mid]), _LOG_SF_Q_GRID, log_ff_grid)),
             float(z),
         )
     return float(result[0]) if scalar_input else result.reshape(q.shape)
@@ -139,6 +185,26 @@ def _legendre_rule(order):
     return nodes, weights
 
 
+@lru_cache(maxsize=256)
+def _cached_waller_hartree_normalizer(atomic_number, order, shape, energy_bytes):
+    energy = np.frombuffer(energy_bytes, dtype=np.float64).reshape(shape)
+    nodes, weights = _legendre_rule(order)
+    s = 0.5 * (nodes + 1.0)
+    cosine = 1.0 - 2.0 * s**2
+    jacobian_weights = 2.0 * s * weights
+    e_flat = np.atleast_1d(energy).ravel()[:, None]
+    ratio = 1.0 / (1.0 + e_flat / ELECTRON_REST_ENERGY_KEV * (1.0 - cosine))
+    kn_shape = ratio**2 * (ratio + 1.0 / ratio - 1.0 + cosine**2)
+    q = (e_flat / HC_KEV_ANGSTROM) * s
+    sf = incoherent_scattering_function(atomic_number, q)
+    integral = np.sum(kn_shape * sf * jacobian_weights, axis=-1)
+    if len(shape) == 0:
+        return float(integral[0])
+    result = integral.reshape(shape)
+    result.setflags(write=False)
+    return result
+
+
 def _waller_hartree_normalizer(energy_keV, atomic_number, order=64):
     """Integral over cos(theta) in [-1, 1] of KN_shape(E, cos(theta)) * S(q, Z).
 
@@ -146,20 +212,13 @@ def _waller_hartree_normalizer(energy_keV, atomic_number, order=64):
     d(cos(theta)) = -4*s ds, which removes the square-root singularity in q(cos)
     at cos(theta) = 1.
     """
-    energy = np.asarray(energy_keV, dtype=float)
+    energy = np.asarray(energy_keV, dtype=np.float64)
     if np.any(~np.isfinite(energy)) or np.any(energy <= 0):
         raise ValueError("Photon energies must be finite and positive.")
-    nodes, weights = _legendre_rule(order)
-    s = 0.5 * (nodes + 1.0)
-    cosine = 1.0 - 2.0 * s**2
-    jacobian_weights = 2.0 * s * weights
-    e_flat = np.atleast_1d(energy).ravel()[:, None]
-    ratio = 1.0 / (1.0 + e_flat / ELECTRON_REST_ENERGY_KEV * (1.0 - cosine))
-    shape = ratio**2 * (ratio + 1.0 / ratio - 1.0 + cosine**2)
-    q = (e_flat / HC_KEV_ANGSTROM) * s
-    sf = incoherent_scattering_function(atomic_number, q)
-    integral = np.sum(shape * sf * jacobian_weights, axis=-1)
-    return float(integral[0]) if energy.ndim == 0 else integral.reshape(energy.shape)
+    _element_sf_table(atomic_number)
+    return _cached_waller_hartree_normalizer(
+        int(atomic_number), int(order), energy.shape, energy.tobytes()
+    )
 
 
 def incoherent_angular_density(energy_keV, cos_theta, atomic_number=None):
@@ -201,8 +260,8 @@ def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
     Within each interval the deposition weights are smooth. Four angles are
     sufficient for its short Compton energy range; wide angular intervals or
     forward-angle binding-suppression intervals use sixteen, and intervals
-    touching a grazing ray use thirty-two. Bounded batches avoid allocating an
-    energy-by-energy-by-angle dense tensor.
+    touching a grazing or exact-forward ray use thirty-two. Bounded batches
+    avoid allocating an energy-by-energy-by-angle dense tensor.
     """
     source = np.flatnonzero((incident_counts > 0) & (mu_incoherent > 0))
     scattered_min = energy[source] / (
@@ -224,8 +283,8 @@ def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
         1.0 / energy[lower_bin + 1] - 1.0 / incident_energy))
     span = cos_right - cos_left
     # Near grazing incidence the escape path varies on the scale of cos(theta);
-    # near cos(theta) -> 1 atomic binding S(q, Z) varies rapidly with q.
-    near_forward = (cos_right > 0.95) if atomic_number is not None else False
+    # near cos(theta) -> 1 atomic binding S(q, Z) varies on the scale of 1 - cos(theta).
+    near_forward = (span > 0.05 * (1.0 - cos_right)) if atomic_number is not None else False
     orders = np.where((span > 0.03) | (span > 0.25 * cos_left) | near_forward, 16, 4)
     orders[(cos_left < 1e-12) | ((atomic_number is not None) & (cos_right > 1.0 - 1e-9))] = 32
     # The total-rate normalizer depends only on incident energy.
@@ -362,3 +421,115 @@ def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
     out_counts = (np.bincount(lower, weights=counts * (1.0 - upper_fraction), minlength=energy.size)
                   + np.bincount(lower + 1, weights=counts * upper_fraction, minlength=energy.size))
     return out_counts / widths
+
+
+@lru_cache(maxsize=256)
+def _cached_coherent_normalizer(atomic_number, order, shape, energy_bytes):
+    energy = np.frombuffer(energy_bytes, dtype=np.float64).reshape(shape)
+    nodes, weights = _legendre_rule(order)
+    s = 0.5 * (nodes + 1.0)
+    cosine = 1.0 - 2.0 * s**2
+    jacobian_weights = 2.0 * s * weights
+    e_flat = np.atleast_1d(energy).ravel()[:, None]
+    thomson_shape = 0.5 * (1.0 + cosine**2)
+    q = (e_flat / HC_KEV_ANGSTROM) * s
+    ff = coherent_form_factor(atomic_number, q)
+    integral = np.sum(thomson_shape * (ff**2) * jacobian_weights, axis=-1)
+    if len(shape) == 0:
+        return float(integral[0])
+    result = integral.reshape(shape)
+    result.setflags(write=False)
+    return result
+
+
+def _coherent_normalizer(energy_keV, atomic_number, order=128):
+    """Integral over cos(theta) in [-1, 1] of 0.5 * (1 + cos^2(theta)) * |F(q, Z)|^2."""
+    energy = np.asarray(energy_keV, dtype=np.float64)
+    if np.any(~np.isfinite(energy)) or np.any(energy <= 0):
+        raise ValueError("Photon energies must be finite and positive.")
+    _element_ff_table(atomic_number)
+    return _cached_coherent_normalizer(
+        int(atomic_number), int(order), energy.shape, energy.tobytes()
+    )
+
+
+def coherent_angular_density(energy_keV, cos_theta, atomic_number=None):
+    """Normalized coherent (Rayleigh) angular probability density per d(cos(theta)).
+
+    If ``atomic_number`` is ``None``, returns the unpolarized Thomson angular
+    density ``(3/8) * (1 + cos^2(theta))`` on ``[-1, 1]``. If ``atomic_number``
+    is an element Z (1..92), weights the Thomson differential cross section by
+    ``|F(q, Z)|^2`` using Hubbell et al. (1975) relativistic Hartree--Fock atomic
+    form factors and normalizes over ``cos(theta)`` in ``[-1, 1]``.
+    """
+    energy = np.asarray(energy_keV, dtype=float)
+    cosine = np.asarray(cos_theta, dtype=float)
+    if np.any(~np.isfinite(energy)) or np.any(energy <= 0):
+        raise ValueError("Photon energies must be finite and positive.")
+    if np.any(~np.isfinite(cosine)) or np.any(np.abs(cosine) > 1):
+        raise ValueError("Scattering-angle cosines must lie in [-1, 1].")
+    if atomic_number is None:
+        return np.broadcast_arrays(0.375 * (1.0 + cosine**2), energy)[0]
+    q = compton_momentum_transfer(energy, cosine)
+    ff = coherent_form_factor(atomic_number, q)
+    normalizer = _coherent_normalizer(energy, atomic_number)
+    return (0.5 * (1.0 + cosine**2) * (ff**2)) / normalizer
+
+
+def coherent_scatter_spectrum(energy_keV, phi_density, mu_total, mu_coherent,
+                              mass_thickness, beam_angle_deg, *,
+                              angular_order=32, atomic_number=None):
+    """Return the accepted singly Rayleigh-scattered photon-fluence density per keV.
+
+    Coherent (Rayleigh) scattering is elastic (``E' = E``), so outgoing photons
+    remain at their incident energy bin while experiencing the longer oblique
+    escape path ``mu_total(E) / cos(theta)`` and the strongly forward-peaked
+    Hubbell form-factor angular distribution ``0.5 * (1 + cos^2(theta)) * |F(q, Z)|^2``.
+    Integration uses the substitution ``s = sin(theta / 2)`` in ``[0, sin(theta_max / 2)]``
+    to concentrate quadrature points in the forward peak and remove the endpoint
+    square-root singularity in ``q(cos(theta))``.
+    """
+    energy = np.asarray(energy_keV, dtype=float)
+    if (energy.ndim != 1 or energy.size < 2 or np.any(~np.isfinite(energy))
+            or np.any(energy <= 0) or np.any(np.diff(energy) <= 0)):
+        raise ValueError("Energy grid must contain at least two increasing positive energies.")
+    spectrum = np.asarray(phi_density, dtype=float)
+    if spectrum.shape != energy.shape or np.any(~np.isfinite(spectrum)) or np.any(spectrum < 0):
+        raise ValueError("Photon density must be finite, nonnegative, and match the energy grid.")
+    mu_total = np.broadcast_to(np.asarray(mu_total, dtype=float), energy.shape)
+    mu_coherent = np.broadcast_to(np.asarray(mu_coherent, dtype=float), energy.shape)
+    if (np.any(~np.isfinite(mu_total)) or np.any(mu_total < 0)
+            or np.any(~np.isfinite(mu_coherent)) or np.any(mu_coherent < 0)):
+        raise ValueError("Attenuation coefficients must be finite and nonnegative.")
+    if not np.isfinite(mass_thickness) or mass_thickness < 0:
+        raise ValueError("Mass thickness must be finite and nonnegative.")
+    if not np.isfinite(beam_angle_deg) or not 0 <= beam_angle_deg <= 180:
+        raise ValueError("Full acceptance-cone angle must lie between 0 and 180 degrees.")
+    if not isinstance(angular_order, (int, np.integer)) or angular_order < 2:
+        raise ValueError("Angular quadrature order must be an integer of at least two.")
+    if atomic_number is not None:
+        _element_ff_table(atomic_number)
+    active = (spectrum > 0) & (mu_coherent > 0)
+    if mass_thickness == 0 or beam_angle_deg == 0 or not np.any(active):
+        return np.zeros_like(energy)
+
+    cos_min = np.cos(np.deg2rad(beam_angle_deg / 2.0))
+    if cos_min == 1.0:
+        return np.zeros_like(energy)
+    s_max = np.sqrt(np.maximum(0.0, (1.0 - cos_min) / 2.0))
+    nodes, weights = _legendre_rule(int(angular_order))
+    s = 0.5 * (nodes + 1.0) * s_max
+    cosine = 1.0 - 2.0 * s**2
+    # d(cos(theta)) = -4 * s ds, with ds = 0.5 * s_max * du -> weight = 2 * s_max * s * w_u
+    dcos_weights = 2.0 * s_max * s * weights
+
+    active_energy = energy[active, None]
+    active_mu_tot = mu_total[active, None]
+    transfer = _depth_integral(active_mu_tot, active_mu_tot / cosine[None, :], mass_thickness)
+    angular_density = coherent_angular_density(
+        active_energy, cosine[None, :], atomic_number=atomic_number
+    )
+    escape_integral = np.sum(transfer * angular_density * dcos_weights[None, :], axis=1)
+    out = np.zeros_like(energy)
+    out[active] = spectrum[active] * mu_coherent[active] * escape_integral
+    return out

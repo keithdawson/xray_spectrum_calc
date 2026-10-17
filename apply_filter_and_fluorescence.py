@@ -22,8 +22,17 @@ import numpy as np
 import pandas as pd
 
 from fluorescence_k_data import FLUOR_K, ATOMIC_MASS
-from spectrum_utils import energy_bin_widths, interpolate_attenuation, add_line_density
-from scatter_transport import single_scatter_spectrum, klein_nishina_total_cross_section
+from spectrum_utils import (
+    energy_bin_widths,
+    interpolate_attenuation,
+    make_attenuation_interpolator,
+    add_line_density,
+)
+from scatter_transport import (
+    single_scatter_spectrum,
+    coherent_scatter_spectrum,
+    klein_nishina_total_cross_section,
+)
 
 AVOGADRO = 6.02214076e23
 
@@ -256,13 +265,60 @@ def klein_nishina_incoherent_mu(E_keV, z):
     electrons_per_g = AVOGADRO * z / ATOMIC_MASS[z]
     return sigma_e * electrons_per_g
 
+def acceptance_cone_from_geometry(filter_to_detector_mm, detector_diameter_mm):
+    """Return full forward acceptance cone angle (deg) subtended by a circular aperture.
+
+    Given downstream distance ``d = filter_to_detector_mm`` (> 0) and active
+    diameter ``D = detector_diameter_mm`` (>= 0), returns
+    ``2 * degrees(atan((D / 2) / d))`` in ``[0, 180)``.
+    """
+    distance = float(filter_to_detector_mm)
+    diameter = float(detector_diameter_mm)
+    if not np.isfinite(distance) or distance <= 0:
+        raise ValueError("Filter-to-detector distance must be finite and positive.")
+    if not np.isfinite(diameter) or diameter < 0:
+        raise ValueError("Detector/aperture diameter must be finite and nonnegative.")
+    return math.degrees(2.0 * math.atan((0.5 * diameter) / distance))
+
+
+def resolve_acceptance_angle_deg(geom_params, layer_spec=None):
+    """Resolve full forward acceptance cone angle (deg) from geom_params or layer_spec."""
+    geom = {} if geom_params is None else dict(geom_params)
+    if layer_spec is not None:
+        if layer_spec.get('beam_angle_deg') is not None:
+            angle = float(layer_spec['beam_angle_deg'])
+            if not np.isfinite(angle) or not 0 <= angle <= 180:
+                raise ValueError("Full forward acceptance angle must be between 0 and 180 degrees.")
+            return angle
+        if layer_spec.get('filter_to_detector_mm') is not None:
+            diam = layer_spec.get(
+                'detector_diameter_mm',
+                geom.get('detector_diameter_mm', 2.0 * float(geom.get('radius_mm', 0.0))),
+            )
+            return acceptance_cone_from_geometry(layer_spec['filter_to_detector_mm'], diam)
+    if geom.get('beam_angle_deg') is not None:
+        angle = float(geom['beam_angle_deg'])
+    elif geom.get('filter_to_detector_mm') is not None and geom.get('detector_diameter_mm') is not None:
+        angle = acceptance_cone_from_geometry(geom['filter_to_detector_mm'], geom['detector_diameter_mm'])
+    elif geom.get('distance_mm') is not None and geom.get('radius_mm') is not None and float(geom['distance_mm']) > 0:
+        angle = acceptance_cone_from_geometry(geom['distance_mm'], 2.0 * float(geom['radius_mm']))
+    else:
+        raise KeyError("geom_params must specify 'beam_angle_deg' or ('filter_to_detector_mm', 'detector_diameter_mm').")
+    if not np.isfinite(angle) or not 0 <= angle <= 180:
+        raise ValueError("Full forward acceptance angle must be between 0 and 180 degrees.")
+    return angle
+
+
 def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_folder,
-                        geom_params, calc_fluorescence=True, calc_scatter=True):
+                        geom_params, calc_fluorescence=True, calc_scatter=True,
+                        calc_rayleigh=True):
     """
     Processes one layer of material.
-    geom_params: dict with 'beam_angle_deg', full forward acceptance angle.
+    geom_params: dict with 'beam_angle_deg' (or 'filter_to_detector_mm' and
+    'detector_diameter_mm'), full forward acceptance angle.
     Plane-parallel, single-interaction approximation per layer. Accepted
-    secondary photons are propagated axially between successive layers.
+    secondary photons (K-fluorescence, incoherent Compton scatter, and coherent
+    Rayleigh scatter) are propagated axially between successive layers.
     """
     # 0. Bin widths for integration/density conversion
     E_in = np.asarray(E_in, dtype=float)
@@ -276,9 +332,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
 
     # 1. Geometry factor (Solid Angle Fraction)
     # Omega / 4pi = (1 - cos(theta)) / 2
-    beam_angle = float(geom_params['beam_angle_deg'])
-    if not np.isfinite(beam_angle) or not 0 <= beam_angle <= 180:
-        raise ValueError("Full forward acceptance angle must be between 0 and 180 degrees.")
+    beam_angle = resolve_acceptance_angle_deg(geom_params)
     if thickness_mm == 0:
         return phi_in.copy(), np.zeros_like(phi_in), np.zeros_like(phi_in), np.ones_like(phi_in)
     
@@ -294,6 +348,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         fluorescence_yield = 0.0
         elem_att = None
         mu_incoh = np.zeros_like(E_in)
+        mu_coh = np.zeros_like(E_in)
         calc_fluorescence = False
         calc_scatter = False
     else:
@@ -306,11 +361,13 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         elem_att = att_df[att_df['Element'] == z]
         if elem_att.empty:
             raise ValueError(f"Missing attenuation data for Z={z}.")
-        mu_tot = interpolate_attenuation(E_in, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+        elem_mu_interp = make_attenuation_interpolator(elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+        mu_tot = elem_mu_interp(E_in)
         
         # Get Fluorescence & Scatter Data (EPDL) if needed
         tauK_eff = np.zeros_like(E_in)
         mu_incoh = None
+        mu_coh = np.zeros_like(E_in)
         needs_k_data = (calc_fluorescence and z in FLUOR_K and beam_angle > 0
                         and np.any((phi_in > 0) & (E_in >= FLUOR_K[z]['K_edge'])))
         have_k_data = False
@@ -344,6 +401,8 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
 
                     if 'E_keV' in df_edpl.columns and 'MT504' in df_edpl.columns:
                         mu_incoh = interpolate_attenuation(E_in, df_edpl['E_keV'], df_edpl['MT504'])
+                    if calc_rayleigh and 'E_keV' in df_edpl.columns and 'MT502' in df_edpl.columns:
+                        mu_coh = interpolate_attenuation(E_in, df_edpl['E_keV'], df_edpl['MT502'])
                 except (ValueError, KeyError) as e:
                     raise ValueError(f"Invalid cross-section data for Z={z}: {e}") from e
             else:
@@ -358,7 +417,8 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         # Mixed cross-section sources can disagree near an absorption edge.
         # Partial interaction rates must never exceed the NIST total rate.
         mu_incoh = np.clip(mu_incoh, 0.0, mu_tot)
-        tauK_eff = np.clip(tauK_eff, 0.0, np.maximum(mu_tot - mu_incoh, 0.0))
+        mu_coh = np.clip(mu_coh, 0.0, np.maximum(mu_tot - mu_incoh, 0.0))
+        tauK_eff = np.clip(tauK_eff, 0.0, np.maximum(mu_tot - mu_incoh - mu_coh, 0.0))
 
         # Fluorescence Parameters (Krause yields, rad-rate-weighted line
         # energies; see generate_fluorescence_data.py)
@@ -393,21 +453,27 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         for line_energy, branching in ((E_Ka, br_ka), (E_Kb, br_kb)):
             if branching <= 0 or not E_in[0] <= line_energy <= E_in[-1]:
                 continue
-            mu_line = interpolate_attenuation(line_energy, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+            mu_line = elem_mu_interp(line_energy)
             transfer = fluorescence_cone_escape(mu_tot, mu_line, rho_t, beam_angle)
             photons = np.sum(phi_in * tauK_eff * transfer * dE) * fluorescence_yield * branching
             add_line_density(phi_fluorescence, E_in, line_energy, photons, dE)
 
-    # 5. Compton (incoherent) Scatter Fog
-    # Single-scatter Waller-Hartree (KN * S(q, Z)) angles, Compton energy loss and oblique escape.
+    # 5. Compton (incoherent) & Rayleigh (coherent) Scatter Fog
+    # Single-scatter Waller-Hartree (KN * S(q, Z)) angles with Compton energy loss
+    # plus elastic Rayleigh (Thomson * |F(q, Z)|^2) forward-cone scatter and oblique escape.
     phi_scatter = np.zeros_like(phi_in)
     if calc_scatter and beam_angle > 0:
         phi_scatter = single_scatter_spectrum(
             E_in, phi_in, mu_tot, mu_incoh, rho_t, beam_angle,
-            lambda energy: interpolate_attenuation(energy, elem_att['Energy_KeV'], elem_att['Mu_over_rho']),
+            elem_mu_interp,
             bin_widths=dE,
             atomic_number=z,
         )
+        if calc_rayleigh and np.any(mu_coh > 0):
+            phi_scatter = phi_scatter + coherent_scatter_spectrum(
+                E_in, phi_in, mu_tot, mu_coh, rho_t, beam_angle,
+                atomic_number=z,
+            )
 
     phi_total = phi_transmitted + phi_fluorescence + phi_scatter
     return phi_total, phi_fluorescence, phi_scatter, transmission_factor
@@ -421,7 +487,7 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         filter_stack (list): List of filter dictionaries, e.g., [{'material': 'Mo', 'thickness': 0.1}].
         att_file (str): Path to the master attenuation data file.
         edpl_folder (str): Path to the folder with EPDL-extracted data.
-        geom_params (dict): Full forward acceptance cone ('beam_angle_deg').
+        geom_params (dict): Full forward acceptance cone ('beam_angle_deg' or physical geometry).
         out_path (str): Path for the output CSV file.
         save_fluorescence (bool): If True, saves a separate CSV with only the fluorescence component.
     """
@@ -467,9 +533,12 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     for f in filter_stack:
         mat = f['material']
         thick = float(f['thickness'])
+        layer_geom = {'beam_angle_deg': resolve_acceptance_angle_deg(geom_params, f)}
         
         print(f"Applying filter: {mat} ({thick} mm)...")
-        Phi, Phi_new_fluoro, Phi_new_scatter, trans_factor = process_single_layer(E, Phi, mat, thick, att_df, edpl_folder, geom_params)
+        Phi, Phi_new_fluoro, Phi_new_scatter, trans_factor = process_single_layer(
+            E, Phi, mat, thick, att_df, edpl_folder, layer_geom
+        )
 
         if save_fluorescence:
             # Attenuate existing secondary components and add new ones
@@ -527,7 +596,9 @@ Example Usage:
     p.add_argument('--edpl-folder', default='pyne_edpl', help='Folder with EPDL-extracted CSV files for fluorescence.')
     
     # Geometry args
-    p.add_argument('--beam-angle-deg', type=float, default=30.0, help='Full beam cone angle (degrees).')
+    p.add_argument('--beam-angle-deg', type=float, default=None, help='Full beam cone angle (degrees). Default: 30.0 unless detector geometry is specified.')
+    p.add_argument('--filter-to-detector-mm', type=float, default=None, help='Optional filter-to-detector distance (mm) to compute the acceptance cone.')
+    p.add_argument('--detector-diameter-mm', type=float, default=None, help='Optional active detector/aperture diameter (mm) to compute the acceptance cone.')
 
     p.add_argument('--out', default='final_spectrum.csv', help='Output CSV file path.')
     p.add_argument('--save-fluorescence', action='store_true', help='Save a separate CSV with only the fluorescence component (_fluoro.csv).')
@@ -543,10 +614,16 @@ Example Usage:
         filter_stack.append({'material': material, 'thickness': thickness})
 
     # --- Geom Params ---
+    if args.beam_angle_deg is not None:
+        beam_angle_deg = args.beam_angle_deg
+    elif args.filter_to_detector_mm is not None and args.detector_diameter_mm is not None:
+        beam_angle_deg = acceptance_cone_from_geometry(args.filter_to_detector_mm, args.detector_diameter_mm)
+    else:
+        beam_angle_deg = 30.0
     geom_params = {
-        'radius_mm': 0.0, # Placeholder, as beam_angle_deg is now used
-        'distance_mm': 0.0, # Placeholder, as beam_angle_deg is now used
-        'beam_angle_deg': args.beam_angle_deg
+        'radius_mm': 0.5 * args.detector_diameter_mm if args.detector_diameter_mm is not None else 0.0,
+        'distance_mm': args.filter_to_detector_mm if args.filter_to_detector_mm is not None else 0.0,
+        'beam_angle_deg': beam_angle_deg
     }
     
     # --- Run ---

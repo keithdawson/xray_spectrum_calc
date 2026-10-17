@@ -58,26 +58,22 @@ def plot_spectrum(csv_files):
                 energy_label = f'{total_power_watts:.5e} {power_unit}'
             plt.plot(x, y, label=f"{os.path.basename(csv_file)}\n(Integral: {total_fluence:.5e}; energy: {energy_label}; {normalization})", alpha=0.7)
             
-            # Check for associated fluorescence file (_fluoro.csv)
-            if csv_file.lower().endswith('.csv'):
-                fluoro_file = csv_file[:-4] + '_fluoro.csv'
-            else:
-                fluoro_file = csv_file + '_fluoro.csv'
-            
-            if os.path.exists(fluoro_file) and fluoro_file not in csv_files:
-                try:
-                    df_f = pd.read_csv(fluoro_file)
-                    x_f = df_f[df_f.columns[0]].values
-                    y_f = df_f[df_f.columns[1]].values
-                    
-                    # Calculate stats for fluoro
-                    total_fluence_f = np.sum(y_f * np.gradient(x_f))
-                    
-                    # Plot with dashed line
-                    plt.plot(x_f, y_f, linestyle='--', alpha=0.7, 
-                             label=f"{os.path.basename(fluoro_file)}\n(Fluence: {total_fluence_f:.5e})")
-                except Exception:
-                    pass # Ignore errors reading fluoro file
+            # Check for associated fluorescence (_fluoro.csv) and scatter (_scatter.csv) files
+            base_file = csv_file[:-4] if csv_file.lower().endswith('.csv') else csv_file
+            for suffix, style, component in (('_fluoro.csv', '--', 'Fluence'), ('_scatter.csv', ':', 'Scatter')):
+                companion_file = base_file + suffix
+                if os.path.exists(companion_file) and companion_file not in csv_files:
+                    try:
+                        df_c = pd.read_csv(companion_file)
+                        x_c = df_c[df_c.columns[0]].values
+                        y_c = df_c[df_c.columns[1]].values
+                        total_fluence_c = np.sum(y_c * energy_bin_widths(x_c))
+                        plt.plot(
+                            x_c, y_c, linestyle=style, alpha=0.7,
+                            label=f"{os.path.basename(companion_file)}\n({component}: {total_fluence_c:.5e})"
+                        )
+                    except Exception:
+                        pass  # Ignore errors reading companion file
         except Exception as e:
             print(f"Error reading {csv_file}: {e}")
 

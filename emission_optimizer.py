@@ -55,7 +55,7 @@ def _cache_path(settings, attenuation_path, materials, densities):
 
 
 def run_emission_optimizer(kvp=220, max_thickness_mm=2.0, th=12, targ='W', dk=0.1,
-                           *, threshold_kev=57.0):
+                           *, threshold_kev=57.0, filter_materials=None):
     """Find a primary-beam hardening filter for each practical material.
 
     Maximize (removed low-band energy fluence %) * (retained high-band
@@ -77,10 +77,18 @@ def run_emission_optimizer(kvp=220, max_thickness_mm=2.0, th=12, targ='W', dk=0.
     if not 0 < threshold_kev < kvp:
         raise ValueError('The energy threshold must be positive and below the tube voltage.')
 
+    materials = (
+        list(PRACTICAL_FILTER_MATERIALS)
+        if filter_materials is None
+        else list(dict.fromkeys(filter_materials))
+    )
+    if not materials or any(sym not in SYM_TO_Z or sym not in DENSITIES for sym in materials):
+        raise ValueError('filter_materials must be a non-empty list of valid element symbols.')
+
     attenuation_path = DATA_DIR / 'attenuation_coefficients_long.csv'
     settings = dict(kvp=kvp, max_thickness_mm=max_thickness_mm, th=th,
                     targ=targ, dk=dk, threshold_kev=threshold_kev)
-    cache_file = _cache_path(settings, attenuation_path, PRACTICAL_FILTER_MATERIALS, DENSITIES)
+    cache_file = _cache_path(settings, attenuation_path, materials, DENSITIES)
     if cache_file.exists():
         return _best_per_material(pd.read_csv(cache_file))
 
@@ -104,7 +112,7 @@ def run_emission_optimizer(kvp=220, max_thickness_mm=2.0, th=12, targ='W', dk=0.
         thicknesses_mm = np.append(thicknesses_mm, max_thickness_mm)
     results = []
 
-    for sym in PRACTICAL_FILTER_MATERIALS:
+    for sym in materials:
         z = SYM_TO_Z[sym]
         elem_att = att_df[att_df['Element'] == z]
         if elem_att.empty:

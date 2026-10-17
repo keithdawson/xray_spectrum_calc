@@ -7,6 +7,9 @@ import numpy as np
 from scatter_transport import (
     ELECTRON_REST_ENERGY_KEV,
     THOMSON_CROSS_SECTION_CM2,
+    coherent_angular_density,
+    coherent_form_factor,
+    coherent_scatter_spectrum,
     incoherent_angular_density,
     incoherent_scattering_function,
     klein_nishina_angular_density,
@@ -207,6 +210,36 @@ class TestScatterTransport(unittest.TestCase):
         escape = (np.exp(-0.03) - np.exp(-0.03 / cosine)) / (0.3 / cosine - 0.3)
         expected = np.sum(0.2 * escape * incoherent_angular_density(60.0, cosine, atomic_number=74) * dc)
         self.assertAlmostEqual(np.sum(bound_scatter * widths) / expected, 1.0, places=5)
+
+    def test_coherent_rayleigh_form_factor_and_elastic_cone_transport(self):
+        for z in (13, 29, 42, 74, 82):
+            self.assertAlmostEqual(float(coherent_form_factor(z, 0.0)), float(z), places=5)
+            self.assertTrue(np.all(np.diff(
+                coherent_form_factor(z, np.geomspace(1e-4, 50.0, 50))) <= 0))
+
+        # Unit normalization of coherent_angular_density over [-1, 1] using s = sin(theta/2)
+        nodes, weights = np.polynomial.legendre.leggauss(128)
+        s = 0.5 * (nodes + 1.0)
+        cosines = 1.0 - 2.0 * s**2
+        jacobian_weights = 2.0 * s * weights
+        energies = np.array([10.0, 30.0, 60.0, 100.0, 225.0])
+        for z in (None, 13, 29, 74):
+            density = coherent_angular_density(energies[:, None], cosines, atomic_number=z)
+            np.testing.assert_allclose(density @ jacobian_weights, np.ones(energies.size), rtol=2e-5)
+
+        # Elastic scattering preserves photon energy bin-by-bin, and F(q, Z)^2 forward peaking
+        # concentrates significantly more scatter into a 30-deg cone than unpolarized Thomson.
+        energy = np.array([20.0, 60.0, 120.0])
+        spectrum = np.array([0.0, 10.0, 0.0])
+        thomson_coh = coherent_scatter_spectrum(
+            energy, spectrum, 0.5, 0.1, 1e-7, 30.0, atomic_number=None)
+        bound_coh = coherent_scatter_spectrum(
+            energy, spectrum, 0.5, 0.1, 1e-7, 30.0, atomic_number=74)
+        self.assertEqual(thomson_coh[0], 0.0)
+        self.assertEqual(thomson_coh[2], 0.0)
+        self.assertEqual(bound_coh[0], 0.0)
+        self.assertEqual(bound_coh[2], 0.0)
+        self.assertGreater(bound_coh[1], 5.0 * thomson_coh[1])
 
 
 if __name__ == "__main__":

@@ -146,6 +146,55 @@ class CnrOptimizerTests(unittest.TestCase):
             row['Dynamic_CNR'], contrast['cnr_per_sqrt_exposure'] / np.sqrt(air['signal_A'])
         )
 
+    def test_include_secondary_fog_penalizes_high_fog_candidate(self):
+        energies = np.array([10.0, 20.0])
+        photons = np.array([10.0, 1.0])
+
+        def exponent(material, e_grid, thickness):
+            coefficients = {
+                'A': [0.0, 0.0],
+                'B': [0.0, np.log(2)],
+                'Shadow': [0.0, 0.0],
+                'Clean': [1.0, 0.0],
+                'Foggy': [1.0, 0.0],
+            }
+            return np.asarray(coefficients[material]) * thickness
+
+        def mock_layer(e_grid, phi_in, material, thickness, table, folder, geometry,
+                       calc_fluorescence, calc_scatter):
+            trans = np.exp(-exponent(material, e_grid, thickness))
+            if material == 'Foggy' and thickness > 0:
+                fog = np.array([0.0, 0.2 * (1.0 - np.exp(-thickness))])
+            else:
+                fog = np.zeros_like(e_grid)
+            return phi_in * trans + fog, fog, np.zeros_like(e_grid), trans
+
+        with patch.object(ct_optimizer, 'detector_response', side_effect=ideal_response), \
+                patch.object(ct_optimizer, 'attenuation_exponent', side_effect=exponent), \
+                patch.object(ct_optimizer.aff, 'process_single_layer', side_effect=mock_layer):
+            _, opt_no_fog = ct_optimizer.run_filter_optimization(
+                energies, photons, 'A', 1.0, 'B', 1.0, 'Shadow', 0.0, 'Shadow', 0.0,
+                'Detector', 1.0, time_penalty_limit=5.0, filter_materials=['Clean', 'Foggy'],
+                include_secondary_fog=False,
+            )
+            _, opt_with_fog = ct_optimizer.run_filter_optimization(
+                energies, photons, 'A', 1.0, 'B', 1.0, 'Shadow', 0.0, 'Shadow', 0.0,
+                'Detector', 1.0, time_penalty_limit=5.0, filter_materials=['Clean', 'Foggy'],
+                include_secondary_fog=True, geom_params={'beam_angle_deg': 45.0},
+            )
+        # Without secondary fog, Clean and Foggy have identical primary attenuation and CNR.
+        np.testing.assert_allclose(
+            opt_no_fog.loc[opt_no_fog['Filter_Material'] == 'Clean', 'Dynamic_CNR'].values,
+            opt_no_fog.loc[opt_no_fog['Filter_Material'] == 'Foggy', 'Dynamic_CNR'].values,
+        )
+        # With secondary fog enabled, Foggy has higher Signal_Max/Variance and lower Dynamic_CNR.
+        clean_row = opt_with_fog[opt_with_fog['Filter_Material'] == 'Clean'].iloc[0]
+        foggy_row = opt_with_fog[opt_with_fog['Filter_Material'] == 'Foggy'].iloc[0]
+        self.assertEqual(opt_with_fog.iloc[0]['Filter_Material'], 'Clean')
+        self.assertGreater(clean_row['Dynamic_CNR'], foggy_row['Dynamic_CNR'])
+        self.assertGreater(foggy_row['Secondary_Fog_Pct'], 0.0)
+        self.assertEqual(clean_row['Secondary_Fog_Pct'], 0.0)
+
 
 class FluorescenceOptimizerTests(unittest.TestCase):
     def test_downstream_attenuation_is_applied_after_fluorescence_generation(self):
@@ -274,6 +323,51 @@ class FluorescenceOptimizerTests(unittest.TestCase):
         self.assertEqual(top_fluor_only.iloc[0]['Filter_Material'], 'ScatterFilter')
         self.assertEqual(top_with_scatter.iloc[0]['Filter_Material'], 'CleanFilter')
         self.assertGreater(top_with_scatter.iloc[0]['Secondary_elim'], 0.5)
+
+    def test_multi_layer_upstream_filters_cascade(self):
+        energies = np.array([10.0, 20.0, 40.0])
+        primary = np.array([0.0, 0.0, 10.0])
+
+        def layer(energies, photons, material, thickness, table, folder, geometry,
+                  calc_fluorescence, calc_scatter):
+            if thickness == 0:
+                return photons, np.zeros(3), np.zeros(3), np.ones(3)
+            if material == 'W_Layer':
+                # Emits 20-keV fluorescence from 40-keV primary
+                fl = np.array([0.0, 2.0, 0.0]) if photons[2] > 0 else np.zeros(3)
+                trans = np.array([1.0, 1.0, 0.5])
+                return photons * trans + fl, fl, np.zeros(3), trans
+            if material == 'Sn_Layer':
+                # Absorbs 20-keV fluorescence and emits 10-keV daughter fluorescence
+                fl = np.array([1.0, 0.0, 0.0]) if photons[1] > 0 else np.zeros(3)
+                trans = np.array([1.0, 0.1, 0.9])
+                return photons * trans + fl, fl, np.zeros(3), trans
+            if material == 'Cu_Layer':
+                # Absorbs 10-keV daughter fluorescence while keeping 40-keV primary
+                trans = np.array([0.1, 0.8, 0.95])
+                return photons * trans, np.zeros(3), np.zeros(3), trans
+            raise AssertionError(f'Unexpected material: {material}')
+
+        with patch.object(ct_optimizer.aff, 'process_single_layer', side_effect=layer):
+            sweep, top = ct_optimizer.run_fluorescence_optimization(
+                energies, primary,
+                candidate_materials=['Cu_Layer'],
+                upstream_filters=[
+                    {'material': 'W_Layer', 'thickness': 0.2},
+                    {'material': 'Sn_Layer', 'thickness': 0.1},
+                ],
+            )
+        active = sweep[sweep['Thickness_mm'] > 0].iloc[0]
+        # Upstream exit has 0.2 at 20 keV (power=0.2*20*15=60) and 1.0 at 10 keV (power=1.0*10*10=100) -> F0=160.
+        # Cu_Layer transmits 10% of 10 keV (10) and 80% of 20 keV (48) -> F=58, F_elim = 1 - 58/160 = 0.6375.
+        self.assertAlmostEqual(active['F_Total'], 58.0)
+        self.assertAlmostEqual(active['F_elim'], 1.0 - 58.0 / 160.0)
+        self.assertAlmostEqual(active['P_kept'], 0.95)
+        self.assertGreater(top.iloc[0]['Thickness_mm'], 0.0)
+        with self.assertRaises(ValueError):
+            ct_optimizer.run_fluorescence_optimization(energies, primary, upstream_filters=[])
+        with self.assertRaises(ValueError):
+            ct_optimizer.run_fluorescence_optimization(energies, primary)
 
 
 if __name__ == '__main__':
