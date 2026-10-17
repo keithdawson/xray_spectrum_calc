@@ -1,118 +1,128 @@
+"""Primary-ray target contrast and an idealized energy-integrating detector.
+
+The detector retains energy transferred locally at the first interaction. It
+assumes charged-particle energy is deposited locally and secondary photons
+escape. It is not a finite-screen fluorescence/Compton transport calculation.
+"""
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import spekpy
 
-from apply_filter_and_fluorescence import SYM_TO_Z
+from apply_filter_and_fluorescence import (
+    AIR_COMPOSITION, DENSITIES, SYM_TO_Z, get_mixture_attenuation,
+)
+from ct_materials import MATERIAL_DEFINITIONS
+from spectrum_utils import energy_bin_widths, integrate_spectrum
 
-# Mass-fraction compositions for compound scintillators (must stay in sync
-# with the definitions in ct_materials.py)
 COMPOUND_COMPOSITIONS = {
-    'Gadox': {64: 0.831, 8: 0.085, 16: 0.085},
-    'CsI': {55: 0.512, 53: 0.488},
+    material: definition[1] for material, definition in MATERIAL_DEFINITIONS.items()
 }
-
 _ATT_DF_CACHE = {}
 
 
-def _muen_over_mu(material, energies):
-    """Ratio of mass energy-absorption to mass attenuation coefficient for
-    a material, from the NIST element table. Fraction of an interacting
-    photon's energy that is locally deposited (the rest leaves as scattered
-    or fluorescence photons)."""
+def _attenuation_table():
     if 'att' not in _ATT_DF_CACHE:
-        _ATT_DF_CACHE['att'] = pd.read_csv('attenuation_coefficients_long.csv')
-    att_df = _ATT_DF_CACHE['att']
+        _ATT_DF_CACHE['att'] = pd.read_csv(
+            Path(__file__).resolve().with_name('attenuation_coefficients_long.csv')
+        )
+    return _ATT_DF_CACHE['att']
 
-    comp = COMPOUND_COMPOSITIONS.get(material)
-    if comp is None:
-        z = SYM_TO_Z.get(material)
-        if z is None:
-            return np.ones_like(energies, dtype=float)
-        comp = {z: 1.0}
 
-    mu = np.zeros_like(energies, dtype=float)
-    mu_en = np.zeros_like(energies, dtype=float)
-    for z, w in comp.items():
-        el = att_df[att_df['Element'] == z]
-        mu += w * np.interp(energies, el['Energy_KeV'], el['Mu_over_rho'])
-        mu_en += w * np.interp(energies, el['Energy_KeV'], el['Mu_en_over_rho'])
+def material_coefficients(material, energies):
+    """Return (mu/rho, mu_en/rho, density) from the same NIST table as filters.
 
-    return np.where(mu > 0, mu_en / mu, 1.0)
+    Mass-fraction additivity of mu_en/rho is approximate (radiative charged-
+    particle losses are not strictly additive). At CT energies those corrections
+    are small; see NIST XrayMassCoef, section 3.
+    """
+    if material in MATERIAL_DEFINITIONS:
+        density, composition = MATERIAL_DEFINITIONS[material]
+    elif material == 'Air':
+        density, composition = DENSITIES['Air'], AIR_COMPOSITION
+    elif material in SYM_TO_Z:
+        density, composition = DENSITIES[material], {SYM_TO_Z[material]: 1.0}
+    else:
+        raise ValueError(f'Unsupported CT material: {material!r}')
+    mu, mu_en = get_mixture_attenuation(
+        np.asarray(energies, dtype=float), composition, _attenuation_table()
+    )
+    return mu, mu_en, density
+
+
+def attenuation_exponent(material, energies, thickness_mm):
+    """Narrow-beam exponent mu/rho * density * thickness_cm."""
+    if not np.isfinite(thickness_mm) or thickness_mm < 0:
+        raise ValueError('Material thickness must be finite and nonnegative.')
+    mu, _, density = material_coefficients(material, energies)
+    return mu * density * thickness_mm * 0.1
+
+
+def _muen_over_mu(material, energies):
+    """First-collision local energy fraction, not a screen escape probability."""
+    mu, mu_en, _ = material_coefficients(material, energies)
+    return np.divide(mu_en, mu, out=np.zeros_like(mu), where=mu > 0)
+
+
+def detector_response(energies, scint_mat, scint_thick):
+    """Return interaction probability, mean and second-moment kernels.
+
+    With p = 1-exp(-mu*t) and q = E*mu_en/mu, a Poisson incident bin
+    contributes mean N*p*q and variance N*p*q**2. This treats deposited
+    energy q as deterministic conditional on interaction. Event-to-event
+    energy-loss fluctuations (Swank noise), optical gain noise and electronic
+    noise increase variance. Secondary-photon reabsorption also changes the
+    mean; neither effect can be inferred from mu_en alone.
+
+    NIST: https://physics.nist.gov/PhysRefData/XrayMassCoef/chap3.html
+    Energy-integrating statistics: https://pubmed.ncbi.nlm.nih.gov/17404467/
+    """
+    energies = np.asarray(energies, dtype=float)
+    probability = -np.expm1(-attenuation_exponent(scint_mat, energies, scint_thick))
+    response = energies * _muen_over_mu(scint_mat, energies)
+    return probability, probability * response, probability * response**2
+
+
+def validate_spectrum(energies, photons):
+    energies = np.asarray(energies, dtype=float)
+    photons = np.asarray(photons, dtype=float)
+    energy_bin_widths(energies)
+    if photons.shape != energies.shape or not np.all(np.isfinite(photons)) or np.any(photons < 0):
+        raise ValueError('Photon density must be finite, nonnegative and match the energy grid.')
+    return energies, photons
 
 
 def calculate_contrast(spectrum_df, target_a_mat, target_a_thick, target_b_mat, target_b_thick, scint_mat, scint_thick):
+    """Compare independent primary rays through A and B (thicknesses in mm).
+
+    Signal is deposited keV per unit exposure; variance is keV^2 per unit
+    exposure. For photon density per second these are signal/variance rates.
+    Neither object scatter nor CT reconstruction is included.
     """
-    Calculates the CT contrast between Target A and Target B as seen by a given scintillator.
-    
-    :param spectrum_df: Pandas DataFrame with columns 'Energy_KeV' and 'Photons_per_s'
-    :param target_a_mat: string, name of material A
-    :param target_a_thick: float, thickness of material A in mm
-    :param target_b_mat: string, name of material B
-    :param target_b_thick: float, thickness of material B in mm
-    :param scint_mat: string, name of scintillator material
-    :param scint_thick: float, thickness of scintillator in mm
-    :return: dict containing signals and contrast metrics, and DataFrames of the absorbed spectra
-    """
-    # Load SpekPy mu data source (pene_mu.dat contains the comprehensive NIST data)
-    mu_data = spekpy.SpekTools.MuData('pene_mu.dat')
-    
-    energies = spectrum_df['Energy_KeV'].values
-    photons_in = spectrum_df['Photons_per_s'].values
-    
-    # 1. Transmission through Targets
-    # Mu_t is mu(E) * thickness
-    mu_t_A = mu_data.get_mu_t(target_a_mat, energies, target_a_thick)
-    mu_t_B = mu_data.get_mu_t(target_b_mat, energies, target_b_thick)
-    
-    photons_out_A = photons_in * np.exp(-mu_t_A)
-    photons_out_B = photons_in * np.exp(-mu_t_B)
-    
-    # 2. Scintillator Absorption
-    mu_t_scint = mu_data.get_mu_t(scint_mat, energies, scint_thick)
-    absorption_prob = 1.0 - np.exp(-mu_t_scint)
-    
-    photons_absorbed_A = photons_out_A * absorption_prob
-    photons_absorbed_B = photons_out_B * absorption_prob
-    
-    # 3. Energy Deposition (Signal)
-    # Deposited energy per interacting photon is weighted by mu_en/mu:
-    # Compton-scattered and fluorescence photons carry part of the energy
-    # out of the scintillator (e.g. Gd K-escape at ~43 keV), so counting
-    # full E per interaction would overestimate the signal at high energy.
-    deposit_frac = _muen_over_mu(scint_mat, energies)
-    energy_deposited_A = photons_absorbed_A * energies * deposit_frac
-    energy_deposited_B = photons_absorbed_B * energies * deposit_frac
-    # Integrate (trapz is deprecated in numpy 2.0, renamed to trapezoid)
-    trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
-    
-    total_signal_A = trapz(energy_deposited_A, energies)
-    total_signal_B = trapz(energy_deposited_B, energies)
-    
-    # Weber Contrast (Assuming A is Background)
-    if total_signal_A > 0:
-        contrast = abs(total_signal_A - total_signal_B) / total_signal_A
-    else:
-        contrast = 0.0
-        
-    # Formatting output for visualization
-    df_A = pd.DataFrame({
-        'Energy_KeV': energies,
-        'Photons_per_s': photons_out_A,
-        'Absorbed_Photons_per_s': photons_absorbed_A,
-        'Energy_Deposited_keV_per_s': energy_deposited_A
-    })
-    
-    df_B = pd.DataFrame({
-        'Energy_KeV': energies,
-        'Photons_per_s': photons_out_B,
-        'Absorbed_Photons_per_s': photons_absorbed_B,
-        'Energy_Deposited_keV_per_s': energy_deposited_B
-    })
-    
-    return {
-        'signal_A': total_signal_A,
-        'signal_B': total_signal_B,
-        'contrast': contrast,
-        'df_A': df_A,
-        'df_B': df_B
-    }
+    energies, photons_in = validate_spectrum(
+        spectrum_df['Energy_KeV'].values, spectrum_df['Photons_per_s'].values
+    )
+    probability, mean_kernel, variance_kernel = detector_response(energies, scint_mat, scint_thick)
+    result = {}
+    for label, material, thickness in (
+        ('A', target_a_mat, target_a_thick), ('B', target_b_mat, target_b_thick)
+    ):
+        photons_out = photons_in * np.exp(-attenuation_exponent(material, energies, thickness))
+        energy_deposited = photons_out * mean_kernel
+        variance_density = photons_out * variance_kernel
+        result[f'signal_{label}'] = float(integrate_spectrum(energies, energy_deposited))
+        result[f'variance_{label}'] = float(integrate_spectrum(energies, variance_density))
+        result[f'df_{label}'] = pd.DataFrame({
+            'Energy_KeV': energies,
+            'Photons_per_s': photons_out,
+            # Historical column: interactions, not full-energy absorptions.
+            'Absorbed_Photons_per_s': photons_out * probability,
+            'Energy_Deposited_keV_per_s': energy_deposited,
+            'Variance_keV2_per_s': variance_density,
+        })
+    difference = abs(result['signal_A'] - result['signal_B'])
+    result['contrast'] = difference / result['signal_A'] if result['signal_A'] > 0 else 0.0
+    variance = result['variance_A'] + result['variance_B']
+    result['cnr_per_sqrt_exposure'] = difference / np.sqrt(variance) if variance > 0 else 0.0
+    result['detector_model'] = 'first_collision_deterministic_response'
+    return result

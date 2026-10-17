@@ -1,44 +1,29 @@
 #!/usr/bin/env python3
-"""
-apply_filter_and_fluorescence.py
+"""Narrow-beam attenuation with accepted K fluorescence and Compton scatter.
 
-Usage:
-  python apply_filter_and_fluorescence.py \
-      --spectrum w_tungsten_225kv_spectrum.csv \
-      --filter Mo \
-      --thickness-mm 0.10 \
-      [--edpl-folder ./] \
-      [--attenuation attenuation_coefficients_long.csv] \
-      [--beam-angle-deg 30.0] \
-      [--kbeta_ratio 0.12] \
-      [--out out_spectrum_after_filter.csv]
+Example:
+  python apply_filter_and_fluorescence.py --spectrum input.csv \
+      --filter-materials Mo Al --filter-thicknesses-mm 0.1 1.0 \
+      --beam-angle-deg 30 --save-fluorescence --out filtered.csv
 
-Description:
-  Reads input spectrum (Energy_KeV, Photons_per_s). Uses attenuation_coefficients_long.csv
-  (Energy_KeV, Element, Mu_over_rho, Mu_en_over_rho) and the EPDL-extracted CSV for the
-  chosen element (which must contain columns E_keV, mu_over_rho_cm2_per_g, tauK_over_rho_cm2_per_g)
-  to calculate the transmitted photon spectrum through the filter and add fluorescence
-  (K-alpha and K-beta) emitted by the filter that are traveling mostly along the same path
-  as the incident beam.
-
-  The acceptance of fluoresced photons into the "same path" is modeled based on the
-  source beam cone angle. The fraction of isotropic emission inside that cone is:
-  fraction = (1 - cos(theta)) / 2 with theta = beam_angle / 2.
-
-Notes:
-  - Script expects mass attenuation coefficients in cm^2/g and thickness in mm.
-  - Needs a density mapping for the element (small built-in table includes common metals).
-  - If an EPDL/extracted file can't be found, the script will error with suggestions.
+Spectra use energy-bin centres and fluence density per keV. Cross sections
+are cm^2/g and thicknesses mm. The secondary model uses normally incident
+plane slabs and a full forward acceptance cone; this is not pixel geometry.
+Isotropic K fluorescence and normalized Klein–Nishina scatter include depth-
+dependent oblique escape. See PHYSICS_REVIEW.md for remaining approximations.
 """
 
 import argparse
 import math
+from functools import lru_cache
 from pathlib import Path
 import sys
 import numpy as np
 import pandas as pd
 
 from fluorescence_k_data import FLUOR_K, ATOMIC_MASS
+from spectrum_utils import energy_bin_widths, interpolate_attenuation, add_line_density
+from scatter_transport import single_scatter_spectrum, klein_nishina_total_cross_section
 
 AVOGADRO = 6.02214076e23
 
@@ -196,10 +181,11 @@ def get_mixture_attenuation(energy_axis, components, att_df):
     Computes effective mu/rho for a mixture.
     components: dict {Z: weight_fraction}
     """
-    mu_mix = np.zeros_like(energy_axis)
-    mu_en_mix = np.zeros_like(energy_axis)
     mu_mix = np.zeros_like(energy_axis, dtype=float)
     mu_en_mix = np.zeros_like(energy_axis, dtype=float)
+    if (not components or any(not np.isfinite(w) or w < 0 for w in components.values())
+            or not np.isclose(sum(components.values()), 1.0, atol=1e-8)):
+        raise ValueError("Mixture mass fractions must be nonnegative and sum to one.")
     
     for z, weight in components.items():
         elem_df = att_df[att_df['Element'] == z]
@@ -207,8 +193,8 @@ def get_mixture_attenuation(energy_axis, components, att_df):
             raise ValueError(f"Missing data for Z={z} in attenuation file")
         
         # Interp to spectrum energy axis
-        mu = np.interp(energy_axis, elem_df['Energy_KeV'], elem_df['Mu_over_rho'])
-        mu_en = np.interp(energy_axis, elem_df['Energy_KeV'], elem_df['Mu_en_over_rho'])
+        mu = interpolate_attenuation(energy_axis, elem_df['Energy_KeV'], elem_df['Mu_over_rho'])
+        mu_en = interpolate_attenuation(energy_axis, elem_df['Energy_KeV'], elem_df['Mu_en_over_rho'])
         
         mu_mix += mu * weight
         mu_en_mix += mu_en * weight
@@ -217,33 +203,42 @@ def get_mixture_attenuation(energy_axis, components, att_df):
 
 def calculate_fluorescence_escape(mu_in, mu_out, rho_t):
     """Depth-integrated escape factor for secondary photons generated
-    uniformly along the beam path: integral over mass depth x of
+    along an attenuating beam path: integral over mass depth x of
     exp(-mu_in*x) * exp(-mu_out*(rho_t - x)) dx, in g/cm^2. mu_in is the
     attenuation at the exciting energy, mu_out at the outgoing energy."""
-    mu_in = np.asarray(mu_in, dtype=float)
-    denom = mu_out - mu_in
-    mask = np.isclose(denom, 0.0, atol=1e-7)
-    res = np.zeros_like(mu_in)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        term = (np.exp(-mu_in * rho_t) - np.exp(-mu_out * rho_t)) / denom
-        res[~mask] = np.broadcast_to(term, res.shape)[~mask]
-    if np.any(mask):
-        res[mask] = rho_t * np.exp(-mu_in[mask] * rho_t)
-    return res
+    mu_in, mu_out = np.broadcast_arrays(np.asarray(mu_in, dtype=float),
+                                        np.asarray(mu_out, dtype=float))
+    delta = np.abs(mu_out - mu_in)
+    factor = np.ones_like(delta)
+    np.divide(-np.expm1(-delta * rho_t), delta * rho_t,
+              out=factor, where=delta * rho_t != 0)
+    return rho_t * np.exp(-np.minimum(mu_in, mu_out) * rho_t) * factor
+
+
+@lru_cache(maxsize=8)
+def _fluorescence_quadrature(order):
+    return np.polynomial.legendre.leggauss(order)
+
+
+def fluorescence_cone_escape(mu_in, mu_out, rho_t, beam_angle_deg, order=16):
+    """Isotropic forward emission, including the longer oblique escape path.
+
+    Integrates (1/2) integral[d cos(theta)] of the slab depth integral.
+    The angle is a full acceptance cone, not a detector-size calculation.
+    """
+    nodes, weights = _fluorescence_quadrature(order)
+    lower = math.cos(math.radians(beam_angle_deg / 2.0))
+    cosines = lower + (nodes + 1.0) * (1.0 - lower) / 2.0
+    transfer = calculate_fluorescence_escape(
+        np.asarray(mu_in)[None, :], mu_out / cosines[:, None], rho_t)
+    return np.sum(transfer * weights[:, None], axis=0) * (1.0 - lower) / 4.0
 
 def klein_nishina_incoherent_mu(E_keV, z):
     """Free-electron Klein-Nishina incoherent mass attenuation (cm^2/g).
-    Fallback when no EPDL incoherent data (MT504) is available. Accurate to
-    a few percent above ~30 keV; overestimates at lower energies where
-    electron binding suppresses Compton scattering."""
-    k = np.asarray(E_keV, dtype=float) / 511.0
-    two_pi_re2 = 4.989345e-25  # 2*pi*r_e^2 [cm^2]
-    ln_term = np.log(1.0 + 2.0 * k)
-    sigma_e = two_pi_re2 * (
-        (1.0 + k) / k**2 * (2.0 * (1.0 + k) / (1.0 + 2.0 * k) - ln_term / k)
-        + ln_term / (2.0 * k)
-        - (1.0 + 3.0 * k) / (1.0 + 2.0 * k)**2
-    )
+    Fallback when no tabulated incoherent data (MT504) is available.
+    Ignores binding and overestimates low-energy incoherent scattering;
+    no uniform accuracy guarantee is implied across elements."""
+    sigma_e = klein_nishina_total_cross_section(E_keV)
     electrons_per_g = AVOGADRO * z / ATOMIC_MASS[z]
     return sigma_e * electrons_per_g
 
@@ -251,15 +246,27 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                         geom_params, calc_fluorescence=True, calc_scatter=True):
     """
     Processes one layer of material.
-    geom_params: dict with 'radius_mm', 'distance_mm'
+    geom_params: dict with 'beam_angle_deg', full forward acceptance angle.
+    Plane-parallel, single-interaction approximation per layer. Accepted
+    secondary photons are propagated axially between successive layers.
     """
     # 0. Bin widths for integration/density conversion
-    dE = np.gradient(E_in)
+    E_in = np.asarray(E_in, dtype=float)
+    phi_in = np.asarray(phi_in, dtype=float)
+    dE = energy_bin_widths(E_in)
+    if (phi_in.shape != E_in.shape or not np.all(np.isfinite(phi_in))
+            or np.any(phi_in < 0)):
+        raise ValueError("Photon densities must be finite, nonnegative and match the energy grid.")
+    if not np.isfinite(thickness_mm) or thickness_mm < 0:
+        raise ValueError("Filter thickness must be finite and nonnegative.")
 
     # 1. Geometry factor (Solid Angle Fraction)
     # Omega / 4pi = (1 - cos(theta)) / 2
-    theta = math.radians(geom_params['beam_angle_deg'] / 2.0)
-    frac_accept = (1.0 - math.cos(theta)) / 2.0
+    beam_angle = float(geom_params['beam_angle_deg'])
+    if not np.isfinite(beam_angle) or not 0 <= beam_angle <= 180:
+        raise ValueError("Full forward acceptance angle must be between 0 and 180 degrees.")
+    if thickness_mm == 0:
+        return phi_in.copy(), np.zeros_like(phi_in), np.zeros_like(phi_in), np.ones_like(phi_in)
     
     # 2. Material Properties
     if material.lower() == "air":
@@ -277,18 +284,23 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
         calc_scatter = False
     else:
         z, sym = get_element_properties(material)
-        if z is None:
+        if z not in ATOMIC_MASS:
             raise ValueError(f"Unknown material or element: '{material}'. Please check spelling or update lookup tables.")
         density = DENSITIES.get(sym, 1.0)
         
         # Get Attenuation
         elem_att = att_df[att_df['Element'] == z]
-        mu_tot = np.interp(E_in, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+        if elem_att.empty:
+            raise ValueError(f"Missing attenuation data for Z={z}.")
+        mu_tot = interpolate_attenuation(E_in, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
         
         # Get Fluorescence & Scatter Data (EPDL) if needed
         tauK_eff = np.zeros_like(E_in)
         mu_incoh = None
-        if edpl_folder:
+        needs_k_data = (calc_fluorescence and z in FLUOR_K and beam_angle > 0
+                        and np.any((phi_in > 0) & (E_in >= FLUOR_K[z]['K_edge'])))
+        have_k_data = False
+        if edpl_folder and (needs_k_data or calc_scatter):
             # Try to find file ZA{z:03d}*.csv
             p = Path(edpl_folder)
             candidates = list(p.glob(f"*ZA{z:03d}*.csv"))
@@ -308,19 +320,33 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                                 break
 
                     if 'E_keV' in df_edpl.columns and tau_col:
+                        # Kissel partial cross sections are tabulated only to
+                        # 300 keV. Legacy files contain erroneous zero tails.
+                        support_max = min(float(df_edpl['E_keV'].max()), 300.0)
+                        if needs_k_data and (E_in[0] < df_edpl['E_keV'].min() or E_in[-1] > support_max):
+                            raise ValueError(f"K-shell cross sections for {sym} support {df_edpl['E_keV'].min():g}–{support_max:g} keV; fluorescence cannot be extrapolated.")
                         tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl[tau_col], left=0, right=0)
+                        have_k_data = True
                     else:
                         print(f"Warning: EPDL file for Z={z} ({candidates[0]}) missing required columns.")
 
                     if 'E_keV' in df_edpl.columns and 'MT504' in df_edpl.columns:
-                        mu_incoh = np.interp(E_in, df_edpl['E_keV'], df_edpl['MT504'])
-                except Exception as e:
-                    print(f"Warning: Failed to parse EPDL file for Z={z}: {e}")
+                        mu_incoh = interpolate_attenuation(E_in, df_edpl['E_keV'], df_edpl['MT504'])
+                except (ValueError, KeyError) as e:
+                    raise ValueError(f"Invalid cross-section data for Z={z}: {e}") from e
             else:
-                print(f"Warning: No EPDL data found for Z={z} in '{edpl_folder}'. Fluorescence calculation will be inaccurate (tauK=0).")
+                if needs_k_data:
+                    raise ValueError(f"Missing K-shell cross-section data for {sym} in '{edpl_folder}'.")
+
+        if needs_k_data and not have_k_data:
+            raise ValueError(f"K-shell cross-section data are required for {sym} fluorescence.")
 
         if mu_incoh is None:
             mu_incoh = klein_nishina_incoherent_mu(E_in, z)
+        # Mixed cross-section sources can disagree near an absorption edge.
+        # Partial interaction rates must never exceed the NIST total rate.
+        mu_incoh = np.clip(mu_incoh, 0.0, mu_tot)
+        tauK_eff = np.clip(tauK_eff, 0.0, np.maximum(mu_tot - mu_incoh, 0.0))
 
         # Fluorescence Parameters (Krause yields, rad-rate-weighted line
         # energies; see generate_fluorescence_data.py)
@@ -330,15 +356,10 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
             E_Ka = f_data['Ka']
             E_Kb = f_data['Kb']
             kb_ratio = f_data.get('Kb_ratio', 0.12)
+            tauK_eff = np.where(E_in >= f_data['K_edge'], tauK_eff, 0.0)
         else:
-            # Fallback empirical formulas
-            # K-shell yield: approx Z^4 / (33^4 + Z^4)
-            fluorescence_yield = float(z**4) / (33**4 + z**4)
-            # Moseley's Law: E = 10.2 eV * (Z - 1)^2 for K-alpha
-            E_Ka = 0.0102 * (z - 1)**2
-            # K-beta is roughly 12-15% higher than K-alpha
-            E_Kb = E_Ka * 1.12
-            kb_ratio = 0.12
+            # Low-Z lines outside the tabulated model are not fabricated.
+            fluorescence_yield = 0.0
              
     # 3. Attenuation Calculation
     t_cm = thickness_mm / 10.0
@@ -351,49 +372,29 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
     # 4. Fluorescence Calculation
     phi_fluorescence = np.zeros_like(phi_in)
     
-    if calc_fluorescence and fluorescence_yield > 0:
+    if calc_fluorescence and fluorescence_yield > 0 and beam_angle > 0:
         # K-alpha / K-beta split
         br_ka = 1.0 / (1.0 + kb_ratio)
         br_kb = 1.0 - br_ka
         
         # Attenuation at fluorescence energies
-        mu_Ka = np.interp(E_Ka, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
-        mu_Kb = np.interp(E_Kb, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
-
-        # Calculate transfer factors (vectorized over E_in)
-        transfer_Ka = calculate_fluorescence_escape(mu_tot, mu_Ka, rho_t)
-        transfer_Kb = calculate_fluorescence_escape(mu_tot, mu_Kb, rho_t)
-        
-        # Calculate escaping flux density (before integration)
-        flux_Ka = phi_in * tauK_eff * transfer_Ka
-        flux_Kb = phi_in * tauK_eff * transfer_Kb
-        
-        # Integrate
-        trapz = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
-        total_Ka = trapz(flux_Ka, E_in)
-        total_Kb = trapz(flux_Kb, E_in)
-        
-        # Apply yield, branching, geometry
-        photons_Ka = total_Ka * fluorescence_yield * br_ka * frac_accept
-        photons_Kb = total_Kb * fluorescence_yield * br_kb * frac_accept
-        
-        # Add to bins
-        idx_Ka = (np.abs(E_in - E_Ka)).argmin()
-        idx_Kb = (np.abs(E_in - E_Kb)).argmin()
-        
-        phi_fluorescence[idx_Ka] += photons_Ka / dE[idx_Ka]
-        phi_fluorescence[idx_Kb] += photons_Kb / dE[idx_Kb]
+        for line_energy, branching in ((E_Ka, br_ka), (E_Kb, br_kb)):
+            if branching <= 0 or not E_in[0] <= line_energy <= E_in[-1]:
+                continue
+            mu_line = interpolate_attenuation(line_energy, elem_att['Energy_KeV'], elem_att['Mu_over_rho'])
+            transfer = fluorescence_cone_escape(mu_tot, mu_line, rho_t, beam_angle)
+            photons = np.sum(phi_in * tauK_eff * transfer * dE) * fluorescence_yield * branching
+            add_line_density(phi_fluorescence, E_in, line_energy, photons, dE)
 
     # 5. Compton (incoherent) Scatter Fog
-    # Incoherent scatter in the filter is a distributed secondary source,
-    # just like fluorescence. Approximations: scattered photons keep their
-    # energy (Compton loss is <16% below 100 keV for scatter angles up to
-    # 90 deg) and are emitted isotropically (Klein-Nishina is actually
-    # forward-peaked, so the in-cone fraction is a mild underestimate).
+    # Single-scatter KN angles, Compton energy loss and oblique escape.
     phi_scatter = np.zeros_like(phi_in)
-    if calc_scatter:
-        transfer_scatter = calculate_fluorescence_escape(mu_tot, mu_tot, rho_t)
-        phi_scatter = phi_in * mu_incoh * transfer_scatter * frac_accept
+    if calc_scatter and beam_angle > 0:
+        phi_scatter = single_scatter_spectrum(
+            E_in, phi_in, mu_tot, mu_incoh, rho_t, beam_angle,
+            lambda energy: interpolate_attenuation(energy, elem_att['Energy_KeV'], elem_att['Mu_over_rho']),
+            bin_widths=dE,
+        )
 
     phi_total = phi_transmitted + phi_fluorescence + phi_scatter
     return phi_total, phi_fluorescence, phi_scatter, transmission_factor
@@ -407,7 +408,7 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         filter_stack (list): List of filter dictionaries, e.g., [{'material': 'Mo', 'thickness': 0.1}].
         att_file (str): Path to the master attenuation data file.
         edpl_folder (str): Path to the folder with EPDL-extracted data.
-        geom_params (dict): Dictionary with geometry parameters ('radius_mm', 'distance_mm').
+        geom_params (dict): Full forward acceptance cone ('beam_angle_deg').
         out_path (str): Path for the output CSV file.
         save_fluorescence (bool): If True, saves a separate CSV with only the fluorescence component.
     """
@@ -415,6 +416,12 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         df = pd.read_csv(spectrum_csv)
     except FileNotFoundError:
         raise ValueError(f"Error: Input spectrum file not found at '{spectrum_csv}'")
+
+    # Preserve source normalization across CLI exports as well as app runs.
+    normalization = ('relative/keV' if 'Relative_Intensity' in df.columns
+                     else 'photons/s/keV')
+    if 'Normalization' in df.columns and len(df):
+        normalization = str(df['Normalization'].iloc[0])
 
     # Be flexible with input column names
     if 'Energy_KeV' not in df.columns and 'Energy_keV' in df.columns:
@@ -441,7 +448,7 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
     if 'Energy_MeV' in att_df.columns and 'Energy_KeV' not in att_df.columns:
         att_df['Energy_KeV'] = att_df['Energy_MeV'] * 1000
     
-    dE = np.gradient(E)
+    dE = energy_bin_widths(E)
     print(f"Initial Photon Count: {np.sum(Phi * dE):.2e}")
 
     for f in filter_stack:
@@ -459,18 +466,18 @@ def run_stack(spectrum_csv, filter_stack, att_file, edpl_folder, geom_params, ou
         print(f"  > Photon Count after {mat}: {np.sum(Phi * dE):.2e}")
 
     # Output
-    out_df = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi})
+    out_df = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi, 'Normalization': normalization})
     out_df.to_csv(out_path, index=False)
     print(f"Wrote final spectrum to {out_path}")
     
     if save_fluorescence:
         base = out_path[:-4] if out_path.lower().endswith('.csv') else out_path
 
-        out_df_f = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_fluoro_accum})
+        out_df_f = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_fluoro_accum, 'Normalization': normalization})
         out_df_f.to_csv(base + '_fluoro.csv', index=False)
         print(f"Wrote fluorescence spectrum to {base + '_fluoro.csv'}")
 
-        out_df_s = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_scatter_accum})
+        out_df_s = pd.DataFrame({'Energy_KeV': E, 'Photons_per_s': Phi_scatter_accum, 'Normalization': normalization})
         out_df_s.to_csv(base + '_scatter.csv', index=False)
         print(f"Wrote scatter spectrum to {base + '_scatter.csv'}")
 

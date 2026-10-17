@@ -19,6 +19,9 @@ pip download -d $WheelsDir --platform win_amd64 --python-version 3.11 --only-bin
 Write-Host "Copying application files..."
 Copy-Item "app.py" -Destination $DeployDir -Force
 Copy-Item "apply_filter_and_fluorescence.py" -Destination $DeployDir -Force
+Copy-Item "spectrum_utils.py" -Destination $DeployDir -Force
+Copy-Item "scatter_transport.py" -Destination $DeployDir -Force
+Copy-Item "source_spectrum.py" -Destination $DeployDir -Force
 Copy-Item "fluorescence_k_data.py" -Destination $DeployDir -Force
 Copy-Item "bundled_data.py" -Destination $DeployDir -Force
 Copy-Item "ct_materials.py" -Destination $DeployDir -Force

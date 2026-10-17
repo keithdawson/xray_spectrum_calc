@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import sys
 import os
 import argparse
+from spectrum_utils import energy_bin_widths
 
 def plot_spectrum(csv_files):
     plt.figure(figsize=(12, 7))
@@ -35,7 +36,7 @@ def plot_spectrum(csv_files):
             y = df[y_col].values
 
             # Calculate stats (assuming y is spectral density e.g., photons/keV)
-            dE = np.gradient(x)
+            dE = energy_bin_widths(x)
             total_fluence = np.sum(y * dE)
             
             # Power calculation:
@@ -47,14 +48,21 @@ def plot_spectrum(csv_files):
             # 1 keV = 1.60218e-16 Joules
             total_power_watts = total_power_kev_s * 1.60218e-16
 
-            # Plot
-            plt.plot(x, y, label=f"{os.path.basename(csv_file)}\n(Fluence: {total_fluence:.5e}, Pwr: {total_power_watts:.5e} W)", alpha=0.7)
-            
-            # Check for associated fluorescence file (_flouro.csv)
-            if csv_file.lower().endswith('.csv'):
-                fluoro_file = csv_file[:-4] + '_flouro.csv'
+            normalization = ('relative/keV' if 'Relative_Intensity' in df.columns else 'photons/s/keV')
+            if 'Normalization' in df.columns and len(df):
+                normalization = str(df['Normalization'].iloc[0])
+            if normalization == 'relative/keV':
+                energy_label = f'{total_power_kev_s:.5e} keV·a.u.'
             else:
-                fluoro_file = csv_file + '_flouro.csv'
+                power_unit = 'W/cm²' if normalization == 'photons/cm2/s/keV' else 'W'
+                energy_label = f'{total_power_watts:.5e} {power_unit}'
+            plt.plot(x, y, label=f"{os.path.basename(csv_file)}\n(Integral: {total_fluence:.5e}; energy: {energy_label}; {normalization})", alpha=0.7)
+            
+            # Check for associated fluorescence file (_fluoro.csv)
+            if csv_file.lower().endswith('.csv'):
+                fluoro_file = csv_file[:-4] + '_fluoro.csv'
+            else:
+                fluoro_file = csv_file + '_fluoro.csv'
             
             if os.path.exists(fluoro_file) and fluoro_file not in csv_files:
                 try:

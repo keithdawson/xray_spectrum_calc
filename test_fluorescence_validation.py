@@ -1,93 +1,80 @@
-import apply_filter_and_fluorescence as aff
-import spekpy as sp
+"""Integration checks using shipped cross sections and SpekPy bin centres.
+
+These are conservation/reference checks, not experimental validation of the
+plane-slab model. Photon densities are integrated over bin widths throughout.
+"""
+from pathlib import Path
+import unittest
+
 import numpy as np
 import pandas as pd
+import spekpy
 
-def validate_fluorescence():
-    # Load physical data
-    master_df = aff.load_data("pyne_edpl", "attenuation_coefficients_long.csv")
-    from pathlib import Path
-    edpl_path = Path("pyne_edpl")
-    
-    # Elements to validate: Cu (29), Mo (42), Ag (47), Ta (73)
-    elements = ["Cu", "Mo", "Ag", "Ta"]
-    thickness_cm = 0.005 # 50 um
-    
-    # 100 kVp spectrum to excite all of them (Ta K-edge is ~67 keV)
-    s = sp.Spek(kvp=100, th=12)
-    energies, fluxes = s.get_spectrum(edges=True)
-    
-    spectrum_df = pd.DataFrame({
-        'Energy_KeV': energies,
-        'Photons_per_s': fluxes
-    })
-    
-    results = []
-    
-    for el in elements:
-        print(f"\n--- Validating {el} ---")
-        z, sym = aff.get_element_properties(el)
-        density = aff.DENSITIES.get(sym, 1.0)
-        
-        # We need to manually trace the physics steps in process_single_layer
-        # to find the K-shell photoabsorption rate, and the emitted fluorescence rate
-        
-        thick_mm = thickness_cm * 10
-        geom_params = {'radius_mm': 25.0, 'distance_mm': 1000.0, 'beam_angle_deg': 24.0}
-        
-        # Call process_single_layer
-        Phi_out, Phi_fluoro, _, trans_factor = aff.process_single_layer(
-            spectrum_df['Energy_KeV'].values,
-            spectrum_df['Photons_per_s'].values,
-            el,
-            thick_mm,
-            master_df,
-            edpl_path,
-            geom_params,
-            calc_fluorescence=True,
-            calc_scatter=False
-        )
-        
-        # The sum of fluorescence photons
-        total_fluor = Phi_fluoro.sum() if Phi_fluoro is not None else 0
-        
-        # Theoretical values from the same data the engine uses
-        from fluorescence_k_data import FLUOR_K
-        if z in FLUOR_K:
-            f_data = FLUOR_K[z]
-            wk = f_data['yield']
-            ka = f_data['Ka']
-            kb = f_data['Kb']
-            kb_r = f_data['Kb_ratio']
-        else:
-            wk = float(z**4) / (33**4 + z**4)
-            ka = 0.0102 * (z - 1)**2
-            kb = ka * 1.12
-            kb_r = 0.12
-            
-        print(f"Computed Fluorescence Yield (wk): {wk:.3f}")
-        print(f"Computed K-alpha Energy: {ka:.2f} keV")
-        print(f"Computed K-beta Energy: {kb:.2f} keV")
-        print(f"Total escaping fluorescence photons/s: {total_fluor:.4e}")
-        
-        # Check primary absorption
-        absorbed = spectrum_df['Photons_per_s'].sum() - Phi_out.sum()
-        print(f"Total absorbed primary photons/s: {absorbed:.4e}")
-        print(f"Apparent escape ratio (Fluor / Absorbed): {total_fluor / absorbed:.4e}")
-        
-        results.append({
-            'Element': sym,
-            'Z': z,
-            'wK': wk,
-            'E_Ka': ka,
-            'E_Kb': kb,
-            'Ratio_Ka_Kb': kb_r,
-            'Total_Fluor': total_fluor,
-            'Esc_Ratio': total_fluor / absorbed
-        })
-        
-    df_res = pd.DataFrame(results)
-    df_res.to_csv("validation_results.csv", index=False)
-    
-if __name__ == "__main__":
-    validate_fluorescence()
+import apply_filter_and_fluorescence as aff
+from fluorescence_k_data import FLUOR_K
+from spectrum_utils import integrate_spectrum
+
+ROOT = Path(__file__).resolve().parent
+
+
+class TestPhysicalDataIntegration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.attenuation = pd.read_csv(ROOT / 'attenuation_coefficients_long.csv')
+        source = spekpy.Spek(kvp=100, th=12, dk=0.1)
+        source.filter('Al', 1.)
+        cls.energies, cls.incident = source.get_spectrum()
+
+    def test_real_material_conservation_and_shell_yield(self):
+        for material in ['Cu', 'Mo', 'Ag', 'Ta']:
+            with self.subTest(material=material):
+                energy, incident = self.energies, self.incident
+                total, fluorescence, scatter, transmission = aff.process_single_layer(
+                    energy, incident, material, .05, self.attenuation,
+                    ROOT / 'pyne_edpl', {'beam_angle_deg': 24.})
+                removed_primary = integrate_spectrum(energy, incident * (1-transmission))
+                n_fluor = integrate_spectrum(energy, fluorescence)
+                n_scatter = integrate_spectrum(energy, scatter)
+                yield_k = FLUOR_K[aff.SYM_TO_Z[material]]['yield']
+                acceptance = (1-np.cos(np.deg2rad(12))) / 2
+                self.assertGreater(n_fluor, 0)
+                self.assertGreater(n_scatter, 0)
+                self.assertLessEqual(n_fluor, removed_primary * yield_k * acceptance)
+                self.assertLessEqual(integrate_spectrum(energy, total), integrate_spectrum(energy, incident))
+                self.assertLessEqual(integrate_spectrum(energy, total * energy), integrate_spectrum(energy, incident * energy))
+                np.testing.assert_allclose(total, incident*transmission + fluorescence + scatter)
+                print(f'{material}: fluorescence={n_fluor:.6g}, scatter={n_scatter:.6g}, removed primary={removed_primary:.6g}')
+
+    def test_cross_section_support_and_edge_anchors(self):
+        for z in range(11, 93):
+            data = pd.read_csv(ROOT / 'pyne_edpl' / f'ZA{z:03d}_extracted.csv')
+            self.assertTrue(np.all(np.diff(data.E_keV) > 0), f'Z={z}: duplicate edge anchors')
+            self.assertEqual(data.E_keV.max(), 300.)
+            self.assertGreater(data.tauK_over_rho_cm2_per_g.iloc[-1], 0.)
+            self.assertTrue(np.all(data.loc[data.E_keV < FLUOR_K[z]['K_edge'], 'tauK_over_rho_cm2_per_g'] == 0))
+        with self.assertRaisesRegex(ValueError, '300'):
+            aff.process_single_layer(np.array([299., 301.]), np.ones(2), 'Mo', .1,
+                                     self.attenuation, ROOT / 'pyne_edpl', {'beam_angle_deg': 30.})
+
+    def test_low_z_alpha_only_emitters(self):
+        for material in ['Na', 'Mg']:
+            z = aff.SYM_TO_Z[material]
+            self.assertEqual(FLUOR_K[z]['Kb_ratio'], 0.)
+            energy = np.arange(1., 10.01, .01)
+            incident = np.where(energy > 3., 1., 0.)
+            _, fluorescence, _, _ = aff.process_single_layer(
+                energy, incident, material, .01, self.attenuation,
+                ROOT / 'pyne_edpl', {'beam_angle_deg': 30.}, calc_scatter=False)
+            self.assertGreater(integrate_spectrum(energy, fluorescence), 0.)
+            mean_energy = integrate_spectrum(energy, fluorescence * energy) / integrate_spectrum(energy, fluorescence)
+            self.assertAlmostEqual(mean_energy, FLUOR_K[z]['Ka'], places=10)
+
+    def test_nist_anchor_and_no_runtime_generator_dependencies(self):
+        # Published NIST Cu value at 100 keV is 0.4584 cm2/g.
+        copper = self.attenuation[self.attenuation.Element == 29]
+        self.assertAlmostEqual(copper.loc[copper.Energy_KeV == 100., 'Mu_over_rho'].iloc[0], .4584)
+        self.assertEqual(self.attenuation.Element.nunique(), 92)
+
+
+if __name__ == '__main__':
+    unittest.main()

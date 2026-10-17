@@ -4,7 +4,12 @@ import pandas as pd
 import os
 import shutil
 import math
-from apply_filter_and_fluorescence import process_single_layer, run_stack, DENSITIES
+from apply_filter_and_fluorescence import (
+    process_single_layer, run_stack, DENSITIES, calculate_fluorescence_escape,
+    fluorescence_cone_escape,
+)
+from fluorescence_k_data import FLUOR_K
+from spectrum_utils import energy_bin_widths, integrate_spectrum, interpolate_attenuation, add_line_density
 
 class TestFluorescencePhysics(unittest.TestCase):
     def setUp(self):
@@ -125,7 +130,79 @@ class TestFluorescencePhysics(unittest.TestCase):
         _, fl_0, _, _ = process_single_layer(self.E_kev, phi_in, 'Mo', 0.1, self.att_df, self.edpl_folder, {'beam_angle_deg': 0.0})
         
         self.assertEqual(np.sum(fl_0), 0.0)
-        self.assertAlmostEqual(np.sum(fl_180) / np.sum(fl_90), 0.5 / 0.1464466, places=2)
+        self.assertGreater(fl_180.sum(), fl_90.sum())
+        # Oblique rays travel farther through the foil. Solid angle alone
+        # overestimates hemisphere escape for finite optical thickness.
+        self.assertLess(fl_180.sum() / fl_90.sum(), 0.5 / 0.1464466)
+        thin_180 = fluorescence_cone_escape(np.array([50.0]), 10.0, 1e-10, 180.0)
+        thin_90 = fluorescence_cone_escape(np.array([50.0]), 10.0, 1e-10, 90.0)
+        self.assertAlmostEqual(float(thin_180[0] / thin_90[0]), 0.5 / 0.1464466094, places=5)
+
+    def test_depth_and_angle_integrals_against_quadrature(self):
+        from scipy.integrate import quad
+        for mu_in, mu_out, depth in [(10.0, 10.0 + 1e-12, 0.2), (50., 10., 0.1), (1000., 1., 1.)]:
+            expected = quad(lambda x: np.exp(-mu_in*x - mu_out*(depth-x)), 0, depth,
+                            epsabs=1e-14)[0]
+            self.assertAlmostEqual(float(calculate_fluorescence_escape(mu_in, mu_out, depth)), expected, places=12)
+        expected = quad(lambda c: quad(
+            lambda x: np.exp(-50*x - 10/c*(0.1-x)), 0, 0.1)[0] / 2,
+            np.cos(np.deg2rad(30)), 1)[0]
+        actual = fluorescence_cone_escape(np.array([50.]), 10., 0.1, 60.)[0]
+        self.assertAlmostEqual(actual, expected, places=12)
+
+    def test_last_bin_and_line_energy_are_conserved(self):
+        phi = np.zeros_like(self.E_kev)
+        phi[-1] = 1e6
+        thickness = 1e-7
+        _, fluorescence, _, _ = process_single_layer(
+            self.E_kev, phi, 'Mo', thickness, self.att_df, self.edpl_folder,
+            {'beam_angle_deg': 30}, calc_scatter=False)
+        atom = FLUOR_K[42]
+        expected = 1e6 * 40 * DENSITIES['Mo'] * thickness / 10 * atom['yield'] * (1-np.cos(np.deg2rad(15))) / 2
+        self.assertAlmostEqual(fluorescence.sum() / expected, 1, places=5)
+        expected_mean = (atom['Ka'] + atom['Kb_ratio'] * atom['Kb']) / (1 + atom['Kb_ratio'])
+        # Residual differential self-absorption is O(thickness).
+        self.assertAlmostEqual(float(np.dot(fluorescence, self.E_kev) / fluorescence.sum()), expected_mean, delta=1e-6)
+        energy = np.array([1., 8., 17., 19., 30.])
+        line = np.zeros_like(energy)
+        add_line_density(line, energy, atom['Ka'], 100.)
+        self.assertAlmostEqual(integrate_spectrum(energy, line), 100., places=12)
+        self.assertAlmostEqual(integrate_spectrum(energy, line * energy), 100. * atom['Ka'], places=10)
+
+    def test_lines_outside_grid_are_not_moved_to_boundary(self):
+        energy = np.array([30., 40., 50.])
+        _, fluorescence, _, _ = process_single_layer(
+            energy, np.ones(3), 'Mo', 0.1, self.att_df, self.edpl_folder,
+            {'beam_angle_deg': 30}, calc_scatter=False)
+        np.testing.assert_array_equal(fluorescence, 0)
+
+    def test_invalid_spectrum_and_negative_thickness_rejected(self):
+        for energy, phi, thickness in [([1.,1.], [1.,1.], .1), ([1.,2.], [-1.,1.], .1),
+                                       ([1.,2.], [1.,1.], -.1)]:
+            with self.assertRaises(ValueError):
+                process_single_layer(energy, phi, 'Mo', thickness, self.att_df,
+                                     self.edpl_folder, {'beam_angle_deg': 30})
+
+    def test_log_interpolation_and_bin_integrals(self):
+        np.testing.assert_allclose(interpolate_attenuation([2.,4.], [1.,8.], [64.,1.]), [16.,4.])
+        with self.assertRaises(ValueError):
+            interpolate_attenuation([9.], [1.,8.], [64.,1.])
+        energy = np.array([1.,2.,4.])
+        self.assertEqual(integrate_spectrum(energy, np.ones(3)), 4.5)
+
+    def test_zero_thickness_and_partial_rate_bounds(self):
+        phi = np.full_like(self.E_kev, 1e5)
+        output, fl, scatter, trans = process_single_layer(
+            self.E_kev, phi, 'Mo', 0., self.att_df, self.edpl_folder, {'beam_angle_deg': 30})
+        np.testing.assert_array_equal(output, phi)
+        np.testing.assert_array_equal(fl + scatter, 0)
+        np.testing.assert_array_equal(trans, 1)
+        # Inconsistent cross-section sources must not create photons.
+        low_mu = self.att_df.copy()
+        low_mu['Mu_over_rho'] = 1.0
+        output, _, _, _ = process_single_layer(
+            self.E_kev, phi, 'Mo', .01, low_mu, self.edpl_folder, {'beam_angle_deg': 180})
+        self.assertLessEqual(integrate_spectrum(self.E_kev, output), integrate_spectrum(self.E_kev, phi))
         
     def test_5_cascading_multi_layer(self):
         '''Test 5: Cascading Multi-Layer Fluorescence'''

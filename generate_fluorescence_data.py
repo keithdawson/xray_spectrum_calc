@@ -10,6 +10,7 @@ Usage: python generate_fluorescence_data.py
 """
 
 import xraylib
+from pathlib import Path
 
 
 def main():
@@ -32,10 +33,15 @@ def main():
             w_k = xraylib.FluorYield(z, xraylib.K_SHELL)
             e_ka = xraylib.LineEnergy(z, xraylib.KA_LINE)
             rate_ka = xraylib.RadRate(z, xraylib.KA_LINE)
-            rate_kb = xraylib.RadRate(z, xraylib.KB_LINE)
             e_edge = xraylib.EdgeEnergy(z, xraylib.K_SHELL)
         except ValueError:
             continue
+        # Na and Mg have no tabulated K-beta transition. They still have
+        # valid K-alpha fluorescence and must not be dropped from the table.
+        try:
+            rate_kb = xraylib.RadRate(z, xraylib.KB_LINE)
+        except ValueError:
+            rate_kb = 0.0
 
         # Weighted K-beta energy from the principal components only; the
         # KB_LINE macro's energy is skewed by weak far-from-peak lines.
@@ -48,14 +54,14 @@ def main():
                 kb_den += r
             except ValueError:
                 continue
-        e_kb = kb_num / kb_den if kb_den > 0 else 0.0
-        if w_k <= 0 or e_ka <= 0 or rate_ka <= 0 or e_kb <= 0:
+        e_kb = kb_num / kb_den if kb_den > 0 else e_ka
+        if w_k <= 0 or e_ka <= 0 or rate_ka <= 0:
             continue
         kb_ratio = rate_kb / rate_ka
         sym = xraylib.AtomicNumberToSymbol(z)
         lines.append(
             f"    {z}: {{'yield': {w_k:.4f}, 'Ka': {e_ka:.3f}, 'Kb': {e_kb:.3f}, "
-            f"'Kb_ratio': {kb_ratio:.4f}, 'K_edge': {e_edge:.3f}}},  # {sym}"
+            f"'Kb_ratio': {kb_ratio:.4f}, 'K_edge': {e_edge:.6f}}},  # {sym}"
         )
 
     lines.append('}')
@@ -69,7 +75,7 @@ def main():
     lines.append('}')
     lines.append('')
 
-    with open('fluorescence_k_data.py', 'w', encoding='utf-8') as f:
+    with open(Path(__file__).resolve().with_name('fluorescence_k_data.py'), 'w', encoding='utf-8') as f:
         f.write('\n'.join(lines))
     print('Wrote fluorescence_k_data.py')
 

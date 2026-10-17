@@ -8,6 +8,8 @@ import io
 import json
 from apply_filter_and_fluorescence import run_stack, PRACTICAL_FILTER_MATERIALS, SYM_TO_Z
 from bundled_data import DEFAULT_SPECTRA
+from source_spectrum import generate_spekpy_spectrum, spectrum_normalization
+from ct_physics import attenuation_exponent
 
 st.set_page_config(page_title='X-ray Spectrum Calculator', layout='wide')
 
@@ -158,10 +160,14 @@ with st.container():
         st.markdown("**Beam Basics**")
         bb_c1, bb_c2 = st.columns(2)
         with bb_c1:
-            beam_angle = st.slider('Beam Cone Angle (deg)', 15.0, 120.0, 30.0, step=2.0)
+            beam_angle = st.slider('Secondary Acceptance Cone (deg)', 15.0, 120.0, 30.0, step=2.0,
+                                   help='Full acceptance angle about each incident ray. This is a plane-slab estimate; it does not calculate detector coverage or focal-spot blur.')
+            tube_current_ma = st.number_input('Tube Current (mA)', min_value=0.001, value=1.0, step=0.1, format='%.3f',
+                                              help='Used for SpekPy spectra. Generated output is photons per cm² per second.')
         with bb_c2:
             tube_window = st.selectbox('Tube Window', options=['Beryllium (2mm)', 'Aluminum (1mm)', 'None'], index=1)
-            distance_to_target = st.number_input('Distance to Target (mm)', value=1000.0, min_value=0.0, step=10.0, format='%.1f')
+            distance_to_target = st.number_input('Distance to Target (mm)', value=1000.0, min_value=1.0, step=10.0, format='%.1f',
+                                                  help='SpekPy uses this source distance for inverse-square fluence. The air path is included for all inputs; imported spectra retain their supplied normalization.')
         
     with top_c2:
         st.markdown("**Target & Detector Context**")
@@ -351,6 +357,8 @@ with col2:
         'spekpy_targ': spekpy_targ,
         'spekpy_dk': spekpy_dk,
         'tube_window': tube_window,
+        'tube_current_ma': tube_current_ma,
+        'source_distance_mm': distance_to_target,
         'uploaded_file_name': uploaded_file.name if uploaded_file else None,
         'beam_angle': beam_angle,
         'distance_to_target': distance_to_target,
@@ -368,13 +376,9 @@ with col2:
         current_spectrum_path = None
         
         if input_option == 'Generate with SpekPy':
-            import spekpy
-            s = spekpy.Spek(kvp=spekpy_kvp, th=spekpy_th, targ=spekpy_targ, dk=spekpy_dk)
-            if tube_window == 'Beryllium (2mm)':
-                s.filter('Be', 2.0)
-            elif tube_window == 'Aluminum (1mm)':
-                s.filter('Al', 1.0)
-            energy, fluence = s.get_spectrum()
+            energy, fluence = generate_spekpy_spectrum(
+                spekpy_kvp, spekpy_th, spekpy_targ, spekpy_dk,
+                tube_current_ma, distance_to_target, tube_window)
             df_spek = pd.DataFrame({'Energy_KeV': energy, 'Photons_per_s': fluence})
             with tempfile.NamedTemporaryFile(delete=False, suffix='.csv', mode='w', encoding='utf-8') as tmp_in:
                 df_spek.to_csv(tmp_in.name, index=False)
@@ -411,6 +415,11 @@ with col2:
                     
                     res_df = pd.read_csv(out_path)
                     input_df = pd.read_csv(current_spectrum_path)
+                    normalization = spectrum_normalization(input_df, input_option == 'Generate with SpekPy')
+                    if st.session_state.get('previous_normalization') != normalization:
+                        for key in ('prev_power_watts', 'prev_total_flux', 'prev_f_power', 'prev_s_power'):
+                            st.session_state.pop(key, None)
+                    st.session_state.previous_normalization = normalization
                     
                     # Calculate Power at Target
                     E_out = res_df['Energy_KeV'].values
@@ -479,7 +488,11 @@ with col2:
                                     s_delta_str = f"{pct_s:.2f}%"
                                 st.session_state.prev_s_power = s_power
 
+                    for frame in (res_df, fluoro_df, scatter_df):
+                        if frame is not None:
+                            frame['Normalization'] = normalization
                     st.session_state.calculated_spectrum = {
+                        'normalization': normalization,
                         'res_df': res_df,
                         'fluoro_df': fluoro_df,
                         'scatter_df': scatter_df,
@@ -531,6 +544,7 @@ with col2:
                 p1['spekpy_targ'] != p2['spekpy_targ'] or
                 p1['spekpy_dk'] != p2.get('spekpy_dk') or
                 p1['tube_window'] != p2['tube_window'] or
+                p1['tube_current_ma'] != p2.get('tube_current_ma') or
                 p1['uploaded_file_name'] != p2['uploaded_file_name'] or
                 p1['beam_angle'] != p2['beam_angle'] or
                 p1['distance_to_target'] != p2['distance_to_target'] or
@@ -547,12 +561,23 @@ with col2:
         if is_stale:
             st.warning("⚠️ **Results are out of date.** Input settings or filter stack have changed. Click **🚀 Calculate Spectrum** to update.")
             
+        normalization = calc_data.get('normalization', 'photons/s/keV')
+        per_area = normalization == 'photons/cm2/s/keV'
+        relative = normalization == 'relative/keV'
+        flux_unit = 'a.u.' if relative else ('ph/cm²/s' if per_area else 'ph/s')
+        signal_unit = 'keV·a.u.' if relative else ('keV/cm²/s' if per_area else 'keV/s')
+        def display_power(value):
+            if relative:
+                return f'{format_sci(value / 1.60218e-16)} keV·a.u.'
+            return format_power(value) + ('/cm²' if per_area else '')
+        st.caption('Generated spectra use tube current and inverse-square distance scaling. CSV downloads preserve normalization metadata. Imported spectra without metadata retain the units implied by their input column.')
+        st.caption('Secondary radiation is a plane-slab cone estimate. Detector size, filter positions, object scatter, Rayleigh scatter, L-shell emission and multiple interactions within each foil are not modeled.')
         cols_m = st.columns(4)
-        cols_m[0].metric('Power at DUT', format_power(power_watts), delta=calc_data['delta_power_str'])
-        cols_m[1].metric('Total Flux', f"{format_sci(total_flux)} ph/s", delta=calc_data['delta_flux_str'])
+        cols_m[0].metric('Energy output at DUT' if relative else ('Power density at DUT' if per_area else 'Power at DUT'), display_power(power_watts), delta=calc_data['delta_power_str'])
+        cols_m[1].metric('Photon fluence rate' if per_area else 'Integrated photon output', f"{format_sci(total_flux)} {flux_unit}", delta=calc_data['delta_flux_str'])
 
         if fluoro_df is not None:
-            cols_m[2].metric('Fluorescence Power at DUT', format_power(f_power), delta=calc_data['f_delta_str'], delta_color='inverse')
+            cols_m[2].metric('Fluorescence energy output', display_power(f_power), delta=calc_data['f_delta_str'], delta_color='inverse')
             cols_m[3].metric('Fluorescence %', f"{pct_of_total:.3f}%")
 
         if scatter_df is not None:
@@ -560,8 +585,8 @@ with col2:
             s_pct = calc_data.get('s_pct_of_total', 0.0)
             cols_s = st.columns(4)
             cols_s[0].metric('Total Secondary %', f"{(s_pct + pct_of_total):.3f}%",
-                             help="Fluorescence + Compton scatter as a fraction of total power at the DUT. This is the 'fog' contribution from the filter stack acting as a secondary extended source.")
-            cols_s[2].metric('Compton Scatter Power at DUT', format_power(s_power), delta=calc_data.get('s_delta_str'), delta_color='inverse')
+                             help="Accepted K fluorescence + Compton scatter as a fraction of modeled total energy fluence. This is a cone estimate, not a spatial blur or detector fog measurement.")
+            cols_s[2].metric('Compton scatter energy output', display_power(s_power), delta=calc_data.get('s_delta_str'), delta_color='inverse')
             cols_s[3].metric('Scatter %', f"{s_pct:.3f}%")
 
         fig = go.Figure()
@@ -601,7 +626,7 @@ with col2:
 
         fig.update_layout(
             xaxis_title='Energy (keV)',
-            yaxis_title='Fluence (Photons/s/keV)',
+            yaxis_title=f'Spectral density ({flux_unit}/keV)',
             xaxis=dict(range=[0, x_max]),
             yaxis=yaxis_cfg,
             height=550,
@@ -642,13 +667,9 @@ with col2:
             if fluor_opt_btn and has_filter:
                 if input_option == 'Generate with SpekPy':
                     try:
-                        import spekpy
-                        s = spekpy.Spek(kvp=spekpy_kvp, th=spekpy_th, targ=spekpy_targ, dk=spekpy_dk)
-                        if tube_window == 'Beryllium (2mm)':
-                            s.filter('Be', 2.0)
-                        elif tube_window == 'Aluminum (1mm)':
-                            s.filter('Al', 1.0)
-                        energy, fluence = s.get_spectrum()
+                        energy, fluence = generate_spekpy_spectrum(
+                            spekpy_kvp, spekpy_th, spekpy_targ, spekpy_dk,
+                            tube_current_ma, distance_to_target, tube_window)
 
                         import ct_optimizer
                         df_fluor_res, top_fluor_res = ct_optimizer.run_fluorescence_optimization(
@@ -656,13 +677,16 @@ with col2:
                             raw_photons=fluence,
                             mat1=fluor_mat1,
                             thick1=fluor_thick1,
-                            candidate_materials=list(st.session_state.enabled_materials)
+                            candidate_materials=list(st.session_state.enabled_materials),
+                            geom_params={'beam_angle_deg': beam_angle},
+                            downstream_transmission=np.exp(-attenuation_exponent('Air', energy, distance_to_target))
                         )
                         
                         st.session_state.fluor_opt_results = {
                             'df_fluor_res': df_fluor_res,
                             'top_fluor_res': top_fluor_res,
                             'mat1': fluor_mat1,
+                            'beam_angle': beam_angle,
                             'thick1': fluor_thick1,
                             'candidates': list(st.session_state.enabled_materials),
                             'input_option': input_option,
@@ -670,7 +694,8 @@ with col2:
                             'spekpy_th': spekpy_th,
                             'spekpy_targ': spekpy_targ,
                             'spekpy_dk': spekpy_dk,
-                            'tube_window': tube_window
+                            'tube_window': tube_window, 'tube_current_ma': tube_current_ma,
+                            'source_distance_mm': distance_to_target
                         }
                     except Exception as e:
                         st.error(f"Fluorescence optimization failed: {e}")
@@ -683,6 +708,7 @@ with col2:
                 # Check if optimizer results are stale
                 fluor_stale = False
                 if (res['mat1'] != fluor_mat1 or
+                    res.get('beam_angle') != beam_angle or
                     res['thick1'] != fluor_thick1 or
                     res.get('candidates') != st.session_state.enabled_materials or
                     res['input_option'] != input_option or
@@ -690,7 +716,9 @@ with col2:
                     res['spekpy_th'] != spekpy_th or
                     res['spekpy_targ'] != spekpy_targ or
                     res.get('spekpy_dk') != spekpy_dk or
-                    res['tube_window'] != tube_window):
+                    res['tube_window'] != tube_window or
+                    res.get('tube_current_ma') != tube_current_ma or
+                    res.get('source_distance_mm') != distance_to_target):
                     fluor_stale = True
                     
                 if fluor_stale:
@@ -760,7 +788,7 @@ with col2:
                     
         st.markdown('---')
         st.subheader('Target Contrast & Optimization')
-        tab_contrast, tab_opt, tab_emission = st.tabs(['Contrast Analysis', 'Filter Optimizer', 'Emission Line Optimizer'])
+        tab_contrast, tab_opt, tab_emission = st.tabs(['Contrast Analysis', 'Filter Optimizer', 'High-Energy Fluence Optimizer'])
         
         with tab_contrast:
             st.caption("The Contrast Analysis runs automatically when you click **Calculate Spectrum**. It compares the energy deposited by the beam passing through Target A vs Target B based on your current Filter Stack.")
@@ -777,8 +805,8 @@ with col2:
                 )
                 
                 ccols = st.columns(3)
-                ccols[0].metric(f'Signal through A ({target_a_mat})', f"{format_sci(contrast_res['signal_A'])} keV/s")
-                ccols[1].metric(f'Signal through B ({target_b_mat})', f"{format_sci(contrast_res['signal_B'])} keV/s")
+                ccols[0].metric(f'Signal through A ({target_a_mat})', f"{format_sci(contrast_res['signal_A'])} {signal_unit}")
+                ccols[1].metric(f'Signal through B ({target_b_mat})', f"{format_sci(contrast_res['signal_B'])} {signal_unit}")
                 ccols[2].metric('Weber Contrast |A-B|/A', f"{contrast_res['contrast']*100:.2f} %")
                 
                 fig_ct = go.Figure()
@@ -804,7 +832,7 @@ with col2:
                 fig_ct.update_layout(
                     title='Energy Deposited in Scintillator (Signal)',
                     xaxis_title='Energy (keV)',
-                    yaxis_title='Deposited Energy (keV/s)',
+                    yaxis_title=f'Deposited energy density ({signal_unit}/keV)',
                     xaxis=dict(range=[0, float(np.nanmax(df_A['Energy_KeV'].values)) * 1.02]),
                     legend=dict(yanchor='top', y=0.99, xanchor='right', x=0.99),
                     margin=dict(l=0, r=0, t=30, b=0)
@@ -815,6 +843,7 @@ with col2:
                 
         with tab_opt:
             st.caption("Automatically find the best filter to penetrate shadowing material while maximizing Contrast-to-Noise Ratio (CNR).")
+            st.caption('Normalized CNR uses independent A/B ray noise and a fixed detector energy capacity. Multiply by the square root of capacity in keV to obtain the idealized CNR. This primary-ray search includes the selected air path but excludes filter secondaries and object scatter. Detector response assumes local first-interaction deposition; escape/reabsorption fluctuations and optical/electronic noise need detector-specific validation.')
             
             opt_cols1 = st.columns(4)
             opt_shadow1_mat = opt_cols1[0].selectbox('Substrate Material', options=ct_materials.CT_MATERIALS, index=0, key='opt_shadow1_mat')
@@ -834,13 +863,9 @@ with col2:
                 st.info("Running Penetration vs Contrast Filter Optimizer...")
                 if input_option == 'Generate with SpekPy':
                     try:
-                        import spekpy
-                        s = spekpy.Spek(kvp=spekpy_kvp, th=spekpy_th, targ=spekpy_targ, dk=spekpy_dk)
-                        if tube_window == 'Beryllium (2mm)':
-                            s.filter('Be', 2.0)
-                        elif tube_window == 'Aluminum (1mm)':
-                            s.filter('Al', 1.0)
-                        energy, fluence = s.get_spectrum()
+                        energy, fluence = generate_spekpy_spectrum(
+                            spekpy_kvp, spekpy_th, spekpy_targ, spekpy_dk,
+                            tube_current_ma, distance_to_target, tube_window)
 
                         import ct_optimizer
                         import importlib
@@ -855,7 +880,7 @@ with col2:
                                     
                         df_opt_res, top_opt_res = ct_optimizer.run_filter_optimization(
                             energies=energy,
-                            raw_photons=fluence,
+                            raw_photons=fluence * np.exp(-attenuation_exponent('Air', energy, distance_to_target)),
                             target_a_mat=target_a_mat,
                             target_a_thick=target_a_thick,
                             target_b_mat=target_b_mat,
@@ -900,7 +925,8 @@ with col2:
                             'spekpy_th': spekpy_th,
                             'spekpy_targ': spekpy_targ,
                             'spekpy_dk': spekpy_dk,
-                            'tube_window': tube_window
+                            'tube_window': tube_window, 'tube_current_ma': tube_current_ma,
+                            'source_distance_mm': distance_to_target
                         }
                     except Exception as e:
                         st.error(f"Optimization failed: {e}")
@@ -930,7 +956,9 @@ with col2:
                     res['spekpy_th'] != spekpy_th or
                     res['spekpy_targ'] != spekpy_targ or
                     res.get('spekpy_dk') != spekpy_dk or
-                    res['tube_window'] != tube_window):
+                    res['tube_window'] != tube_window or
+                    res.get('tube_current_ma') != tube_current_ma or
+                    res.get('source_distance_mm') != distance_to_target):
                     filter_opt_stale = True
                     
                 if filter_opt_stale:
@@ -948,7 +976,7 @@ with col2:
                         'Plot': st.column_config.CheckboxColumn('Plot', help="Select to display on the chart below"),
                         'Filter_Material': 'Material',
                         'Thickness_mm': st.column_config.NumberColumn('Thickness (mm)', format='%.2f'),
-                        'Dynamic_CNR': st.column_config.NumberColumn('Dynamic CNR', format='%.8f'),
+                        'Dynamic_CNR': st.column_config.NumberColumn('Normalized CNR', format='%.8f'),
                         'Time_Penalty': st.column_config.NumberColumn('Time Penalty', format='%.1fx')
                     },
                     disabled=['Filter_Material', 'Thickness_mm', 'Dynamic_CNR', 'Time_Penalty'],
@@ -980,24 +1008,25 @@ with col2:
                     fig_opt.add_trace(go.Scatter(x=m_df['Time_Penalty'], y=m_df['Thickness_mm'], name=f'{m} Thickness', line=dict(dash='dot'), visible='legendonly'), secondary_y=True)
                     
                 fig_opt.update_layout(
-                    title='Time Penalty vs Dynamic-Range-Limited CNR',
+                    title='Time Penalty vs Normalized CNR at fixed detector capacity',
                     legend=dict(yanchor='top', y=0.99, xanchor='right', x=0.99),
                     margin=dict(l=0, r=0, t=40, b=0)
                 )
-                fig_opt.update_yaxes(title_text="Contrast-to-Noise Ratio (CNR)", secondary_y=False)
+                fig_opt.update_yaxes(title_text="CNR / sqrt(capacity in keV)", secondary_y=False)
                 fig_opt.update_yaxes(title_text="Filter Thickness (mm)", secondary_y=True)
                 fig_opt.update_xaxes(title_text="Time Penalty (x)", range=[1.0, 5.0])
                 
                 st.plotly_chart(fig_opt, width='stretch')
         with tab_emission:
-            st.markdown("### Emission Line Optimizer")
-            st.write("This optimizer evaluates all practical filter materials (elements available as thin foils or discs) across a range of thicknesses to find the best filter for stripping out low-energy background radiation while preserving the Tungsten (W) K-emission lines ($\ge$ 57 keV).")
+            st.markdown("### High-Energy Fluence Optimizer")
+            st.write('Find filters that remove energy fluence below 57 keV while preserving energy fluence at and above 57 keV, including the continuum. This primary-transmission estimate excludes filter fluorescence and scatter; check candidates in the full stack calculator (up to 300 keV).')
+            st.caption('Standalone tungsten source: 12° anode, 0.1-keV bins, no tube-window or air filtration. These settings are independent of the main calculator.')
             
             e_col1, e_col2 = st.columns(2)
             opt_kvp = e_col1.number_input("Tube Voltage (kVp)", min_value=60, max_value=450, value=220, step=10, key='opt_em_kvp')
             opt_max_t = e_col2.number_input("Max Thickness (mm)", min_value=0.1, max_value=10.0, value=2.0, step=0.1, key='opt_em_thick')
             
-            if st.button("Run Emission Optimizer", type="primary"):
+            if st.button("Run High-Energy Optimizer", type="primary"):
                 with st.spinner("Sweeping practical filter materials..."):
                     try:
                         from emission_optimizer import run_emission_optimizer
@@ -1010,7 +1039,7 @@ with col2:
             
             if 'emission_opt_results' in st.session_state and st.session_state.emission_opt_results is not None:
                 if st.session_state.emission_opt_kvp != opt_kvp or st.session_state.emission_opt_max_t != opt_max_t:
-                    st.warning("⚠️ **Settings have changed.** Click 'Run Emission Optimizer' to update results.")
+                    st.warning("⚠️ **Settings have changed.** Click 'Run High-Energy Optimizer' to update results.")
                     
                 df_em = st.session_state.emission_opt_results
                 
