@@ -1,12 +1,16 @@
 """Single-Compton-scatter transport through a normally illuminated plane slab.
 
 The total incoherent coefficient is supplied by the caller (normally the
-binding-corrected table). Its angular distribution is approximated by normalized,
-unpolarized free-electron Klein--Nishina scattering. The Compton energy shift and
-the longer oblique escape path are included. Atomic scattering functions, Doppler
-broadening, coherent scatter and multiple collisions within one slab are omitted.
-The acceptance cone describes directions about an incident ray; it is not a
-detector/pixel geometry calculation.
+binding-corrected table). When ``atomic_number`` is supplied, the angular
+distribution uses the Waller--Hartree / Hubbell et al. (1975) atomic incoherent
+scattering function ``S(q, Z)`` weighting the unpolarized Klein--Nishina cross
+section, suppressing small-angle forward incoherent scattering where bound
+electrons cannot absorb infinitesimal momentum transfers. When ``atomic_number``
+is ``None``, the free-electron Klein--Nishina angular distribution is used.
+The Compton energy shift and the longer oblique escape path are included.
+Doppler broadening, coherent scatter and multiple collisions within one slab are
+omitted. The acceptance cone describes directions about an incident ray; it is
+not a detector/pixel geometry calculation.
 
 Equations and limits: Geant4 Physics Reference Manual, Compton and Livermore:
 https://geant4.web.cern.ch/documentation/dev/prm_html/PhysicsReferenceManual/electromagnetic/gamma_incident/compton/compton.html
@@ -17,10 +21,73 @@ from functools import lru_cache
 
 import numpy as np
 
+from fluorescence_k_data import INCOHERENT_SF, INCOHERENT_SF_Q
+
 
 ELECTRON_REST_ENERGY_KEV = 510.99895
 CLASSICAL_ELECTRON_RADIUS_CM = 2.8179403262e-13
 THOMSON_CROSS_SECTION_CM2 = 8.0 * np.pi * CLASSICAL_ELECTRON_RADIUS_CM**2 / 3.0
+HC_KEV_ANGSTROM = 12.3984193
+
+_SF_Q_GRID = np.asarray(INCOHERENT_SF_Q, dtype=float)
+_LOG_SF_Q_GRID = np.log(_SF_Q_GRID)
+
+
+@lru_cache(maxsize=96)
+def _element_sf_table(atomic_number):
+    if (not isinstance(atomic_number, (int, np.integer))
+            or isinstance(atomic_number, bool)
+            or int(atomic_number) not in INCOHERENT_SF):
+        raise ValueError(f"Unsupported atomic number for incoherent scattering: {atomic_number!r}")
+    z = int(atomic_number)
+    sf = np.asarray(INCOHERENT_SF[z], dtype=float)
+    log_sf = np.log(sf)
+    sf.setflags(write=False)
+    log_sf.setflags(write=False)
+    return z, sf, log_sf
+
+
+def compton_momentum_transfer(energy_keV, cos_theta):
+    """Hubbell momentum-transfer parameter q = (E / hc) * sin(theta / 2) in 1/Angstrom."""
+    energy = np.asarray(energy_keV, dtype=float)
+    cosine = np.asarray(cos_theta, dtype=float)
+    if np.any(~np.isfinite(energy)) or np.any(energy <= 0):
+        raise ValueError("Photon energies must be finite and positive.")
+    if np.any(~np.isfinite(cosine)) or np.any(np.abs(cosine) > 1):
+        raise ValueError("Scattering-angle cosines must lie in [-1, 1].")
+    sin_half = np.sqrt(np.maximum(0.0, (1.0 - cosine) / 2.0))
+    return (energy / HC_KEV_ANGSTROM) * sin_half
+
+
+def incoherent_scattering_function(atomic_number, q_inv_angstrom):
+    """Evaluate Waller--Hartree incoherent scattering function S(q, Z) in [0, Z].
+
+    Uses log-log interpolation over the tabulated [0.005, 50] 1/Angstrom grid,
+    quadratic dipole scaling S(q, Z) ~ q^2 below 0.005 1/Angstrom so S(0, Z) = 0,
+    and saturates at Z above 50 1/Angstrom.
+    """
+    z, sf_grid, log_sf_grid = _element_sf_table(atomic_number)
+    q = np.asarray(q_inv_angstrom, dtype=float)
+    if np.any(~np.isfinite(q)) or np.any(q < 0):
+        raise ValueError("Momentum transfer q must be finite and nonnegative.")
+    scalar_input = q.ndim == 0
+    q_arr = np.atleast_1d(q)
+    result = np.empty_like(q_arr, dtype=float)
+    q_min = _SF_Q_GRID[0]
+    q_max = _SF_Q_GRID[-1]
+    low = q_arr < q_min
+    high = q_arr >= q_max
+    mid = ~(low | high)
+    if np.any(low):
+        result[low] = sf_grid[0] * (q_arr[low] / q_min) ** 2
+    if np.any(high):
+        result[high] = float(z)
+    if np.any(mid):
+        result[mid] = np.minimum(
+            np.exp(np.interp(np.log(q_arr[mid]), _LOG_SF_Q_GRID, log_sf_grid)),
+            float(z),
+        )
+    return float(result[0]) if scalar_input else result.reshape(q.shape)
 
 
 def klein_nishina_total_cross_section(energy_keV):
@@ -72,6 +139,51 @@ def _legendre_rule(order):
     return nodes, weights
 
 
+def _waller_hartree_normalizer(energy_keV, atomic_number, order=64):
+    """Integral over cos(theta) in [-1, 1] of KN_shape(E, cos(theta)) * S(q, Z).
+
+    Uses the substitution s = sin(theta / 2) in [0, 1], cos(theta) = 1 - 2*s^2,
+    d(cos(theta)) = -4*s ds, which removes the square-root singularity in q(cos)
+    at cos(theta) = 1.
+    """
+    energy = np.asarray(energy_keV, dtype=float)
+    if np.any(~np.isfinite(energy)) or np.any(energy <= 0):
+        raise ValueError("Photon energies must be finite and positive.")
+    nodes, weights = _legendre_rule(order)
+    s = 0.5 * (nodes + 1.0)
+    cosine = 1.0 - 2.0 * s**2
+    jacobian_weights = 2.0 * s * weights
+    e_flat = np.atleast_1d(energy).ravel()[:, None]
+    ratio = 1.0 / (1.0 + e_flat / ELECTRON_REST_ENERGY_KEV * (1.0 - cosine))
+    shape = ratio**2 * (ratio + 1.0 / ratio - 1.0 + cosine**2)
+    q = (e_flat / HC_KEV_ANGSTROM) * s
+    sf = incoherent_scattering_function(atomic_number, q)
+    integral = np.sum(shape * sf * jacobian_weights, axis=-1)
+    return float(integral[0]) if energy.ndim == 0 else integral.reshape(energy.shape)
+
+
+def incoherent_angular_density(energy_keV, cos_theta, atomic_number=None):
+    """Normalized incoherent angular probability density per d(cos(theta)).
+
+    If ``atomic_number`` is ``None``, returns the free-electron Klein--Nishina
+    angular density. If ``atomic_number`` is an element Z (1..92), weights the
+    Klein--Nishina differential cross section by the Waller--Hartree incoherent
+    scattering function S(q, Z) and normalizes over cos(theta) in [-1, 1].
+    """
+    if atomic_number is None:
+        return klein_nishina_angular_density(energy_keV, cos_theta)
+    energy = np.asarray(energy_keV, dtype=float)
+    cosine = np.asarray(cos_theta, dtype=float)
+    if np.any(~np.isfinite(cosine)) or np.any(np.abs(cosine) > 1):
+        raise ValueError("Scattering-angle cosines must lie in [-1, 1].")
+    ratio = 1.0 / (1.0 + energy / ELECTRON_REST_ENERGY_KEV * (1.0 - cosine))
+    shape = ratio**2 * (ratio + 1.0 / ratio - 1.0 + cosine**2)
+    q = compton_momentum_transfer(energy, cosine)
+    sf = incoherent_scattering_function(atomic_number, q)
+    normalizer = _waller_hartree_normalizer(energy, atomic_number)
+    return (shape * sf) / normalizer
+
+
 def _depth_integral(mu_in, mu_out_oblique, mass_thickness):
     """Integral exp(-mu_in*x - mu_out_oblique*(T-x)) dx, without cancellation."""
     delta = np.abs(mu_in - mu_out_oblique) * mass_thickness
@@ -82,13 +194,15 @@ def _depth_integral(mu_in, mu_out_oblique, mass_thickness):
 
 
 def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
-                             mass_thickness, cos_min, attenuation_at_energy):
+                             mass_thickness, cos_min, attenuation_at_energy,
+                             atomic_number=None):
     """Integrate separately between output energy centers to resolve line shapes.
 
     Within each interval the deposition weights are smooth. Four angles are
-    sufficient for its short Compton energy range; wide angular intervals use
-    sixteen, and intervals touching a grazing ray use thirty-two. Bounded
-    batches avoid allocating an energy-by-energy-by-angle dense tensor.
+    sufficient for its short Compton energy range; wide angular intervals or
+    forward-angle binding-suppression intervals use sixteen, and intervals
+    touching a grazing ray use thirty-two. Bounded batches avoid allocating an
+    energy-by-energy-by-angle dense tensor.
     """
     source = np.flatnonzero((incident_counts > 0) & (mu_incoherent > 0))
     scattered_min = energy[source] / (
@@ -109,13 +223,17 @@ def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
     cos_right = np.minimum(1.0, 1.0 - ELECTRON_REST_ENERGY_KEV * (
         1.0 / energy[lower_bin + 1] - 1.0 / incident_energy))
     span = cos_right - cos_left
-    # Near grazing incidence the escape path varies on the scale of cos(theta),
-    # even when an interval is narrow in absolute angle.
-    orders = np.where((span > 0.03) | (span > 0.25 * cos_left), 16, 4)
-    orders[cos_left < 1e-12] = 32
+    # Near grazing incidence the escape path varies on the scale of cos(theta);
+    # near cos(theta) -> 1 atomic binding S(q, Z) varies rapidly with q.
+    near_forward = (cos_right > 0.95) if atomic_number is not None else False
+    orders = np.where((span > 0.03) | (span > 0.25 * cos_left) | near_forward, 16, 4)
+    orders[(cos_left < 1e-12) | ((atomic_number is not None) & (cos_right > 1.0 - 1e-9))] = 32
     # The total-rate normalizer depends only on incident energy.
-    normalization = klein_nishina_total_cross_section(energy) / (
-        np.pi * CLASSICAL_ELECTRON_RADIUS_CM**2)
+    if atomic_number is None:
+        normalization = klein_nishina_total_cross_section(energy) / (
+            np.pi * CLASSICAL_ELECTRON_RADIUS_CM**2)
+    else:
+        normalization = _waller_hartree_normalizer(energy, atomic_number)
     for order in (4, 16, 32):
         intervals = np.flatnonzero(orders == order)
         nodes, weights = _legendre_rule(order)
@@ -137,6 +255,9 @@ def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
                 raise ValueError("Outgoing attenuation must be finite and nonnegative.")
             transfer = _depth_integral(mu_total[source_index, None], mu_out / cosine, mass_thickness)
             shape = ratio**2 * (ratio + 1.0 / ratio - 1.0 + cosine**2)
+            if atomic_number is not None:
+                q = (incident / HC_KEV_ANGSTROM) * np.sqrt(np.maximum(0.0, (1.0 - cosine) / 2.0))
+                shape = shape * incoherent_scattering_function(atomic_number, q)
             counts = (incident_counts[source_index, None] * mu_incoherent[source_index, None]
                       * transfer * shape / normalization[source_index, None] * weights * half_span)
             fraction = (outgoing - energy[lower, None]) / (energy[lower + 1] - energy[lower])[:, None]
@@ -149,7 +270,8 @@ def _adaptive_scatter_counts(energy, incident_counts, mu_total, mu_incoherent,
 
 def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
                             mass_thickness, beam_angle_deg, attenuation_at_energy,
-                            *, bin_widths=None, angular_order=None):
+                            *, bin_widths=None, angular_order=None,
+                            atomic_number=None):
     """Return the accepted singly scattered photon-fluence density per keV.
 
     ``mu_total`` and ``mu_incoherent`` are cm^2/g arrays on ``energy_keV``;
@@ -170,9 +292,10 @@ def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
     continuous Compton distribution of an input line even at broad cone angles.
     Set ``angular_order`` to an integer for a fixed whole-cone quadrature rule
     (useful for convergence checks); too few angles can introduce false peaks.
-    Angular accuracy cannot remove the free-electron shape approximation: binding
-    suppresses low-energy forward scattering, which requires atomic scattering
-    functions for quantitative modeling.
+    When ``atomic_number`` is supplied (Z=1..92), the angular distribution is
+    weighted by the Waller--Hartree atomic incoherent scattering function
+    ``S(q, Z)``, accounting for bound-electron suppression of small-angle
+    forward incoherent scatter.
     """
     energy = np.asarray(energy_keV, dtype=float)
     if (energy.ndim != 1 or energy.size < 2 or np.any(~np.isfinite(energy))
@@ -193,6 +316,8 @@ def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
     if angular_order is not None and (
             not isinstance(angular_order, (int, np.integer)) or angular_order < 2):
         raise ValueError("Angular quadrature order must be None or an integer of at least two.")
+    if atomic_number is not None:
+        _element_sf_table(atomic_number)
     widths = np.gradient(energy) if bin_widths is None else np.asarray(bin_widths, dtype=float)
     if widths.shape != energy.shape or np.any(~np.isfinite(widths)) or np.any(widths <= 0):
         raise ValueError("Energy-bin widths must be positive and match the energy grid.")
@@ -206,7 +331,7 @@ def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
     if angular_order is None:
         return _adaptive_scatter_counts(
             energy, spectrum * widths, mu_total, mu_incoherent, mass_thickness,
-            cos_min, attenuation_at_energy) / widths
+            cos_min, attenuation_at_energy, atomic_number=atomic_number) / widths
 
     nodes, weights = _legendre_rule(angular_order)
     half_span = (1.0 - cos_min) / 2.0
@@ -224,7 +349,8 @@ def single_scatter_spectrum(energy_keV, phi_density, mu_total, mu_incoherent,
     if np.any(~np.isfinite(mu_out)) or np.any(mu_out < 0):
         raise ValueError("Outgoing attenuation must be finite and nonnegative.")
     transfer = _depth_integral(mu_total[active, None], mu_out / cosine, mass_thickness)
-    angular_probability = klein_nishina_angular_density(incident_energy, cosine) * angular_weights
+    angular_probability = incoherent_angular_density(
+        incident_energy, cosine, atomic_number=atomic_number) * angular_weights
     incident_counts = spectrum[active] * widths[active]
     counts = (incident_counts[:, None] * mu_incoherent[active, None]
               * transfer * angular_probability)[represented]

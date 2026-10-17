@@ -7,7 +7,7 @@ A toolset for calculating X-ray spectrum attenuation through filter stacks, incl
 
 - **Filter Attenuation**: Calculates transmission through multiple layers of materials (all elements Z=1-92, NIST data with exact absorption-edge steps).
 - **Fluorescence Generation**: Calculates K-alpha and K-beta fluorescence emitted by filters when excited by the beam, for any filter element Z=11-92 (Kissel K-shell cross-sections, Krause yields, weighted line energies; 1–300 keV).
-- **Compton Scatter**: Single-collision transport with Klein–Nishina angular weighting, Compton energy loss and oblique escape. Uses binding-corrected total cross-sections; the angular shape remains a free-electron approximation.
+- **Compton Scatter**: Single-collision transport with Waller–Hartree (`Klein–Nishina × S(q, Z)`) angular weighting, Compton energy loss and oblique escape. Uses binding-corrected total cross-sections and Hubbell atomic incoherent scattering functions to account for small-angle forward binding suppression.
 - **Acceptance Geometry**: Integrates secondary radiation over a specified forward cone through a plane slab. This is a directional acceptance parameter, not a detector geometry or focal-spot blur calculation.
 - **CT Context**: Shared NIST target attenuation and an idealized first-interaction scintillator response weighted by mu_en/mu. CNR uses energy-weighted compound-Poisson variance. Finite-screen escape/reabsorption and detector noise require further validation.
 
@@ -43,8 +43,8 @@ streamlit run app.py
 - **Filter stack editor**: reorderable material + thickness rows, persisted between sessions (`.last_filters.json`).
 - **Results**: power/flux at the DUT with run-over-run deltas, fluorescence and Compton scatter power shown separately (increases flagged red — more fog is bad), log-scale and display-rebinning chart controls, CSV downloads for all three components.
 - **Material selection** (⚙️ Materials): choose which foil elements the dropdowns and optimizers use, from a curated list of 36 practically-purchasable materials; persisted in `.material_settings.json`.
-- **Optimizers**: Cascading Fluorescence (secondary filter to absorb the primary's fluorescence), CNR Filter (penetration vs contrast under shadowing), High-Energy Fluence (preserve the entire band >= 57 keV, including continuum). Each has one-click "Apply" buttons to push results into the filter stack.
-- **Contrast analysis**: energy deposited in the scintillator through Target A vs Target B, with the |A-B| difference trace showing where the contrast comes from.
+- **Optimizers**: Cascading Fluorescence (secondary filter to absorb the primary's fluorescence, with optional Compton scatter fog inclusion), CNR Filter (penetration vs contrast under shadowing), High-Energy Fluence (preserve the entire band >= 57 keV, including continuum). Work with any input spectrum and include one-click "Apply" buttons to push results into the filter stack.
+- **Contrast analysis**: energy deposited in the scintillator through Target A vs Target B, compound-Poisson CNR per √exposure, and the |A-B| difference trace showing where the contrast comes from.
 
 Offline installers for machines without internet can be built with `package_windows.ps1` / `package_linux.ps1` (bundles Python + wheels into `deploy_windows/` / `deploy_linux/`).
 

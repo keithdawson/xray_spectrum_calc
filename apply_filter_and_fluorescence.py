@@ -233,6 +233,20 @@ def fluorescence_cone_escape(mu_in, mu_out, rho_t, beam_angle_deg, order=16):
         np.asarray(mu_in)[None, :], mu_out / cosines[:, None], rho_t)
     return np.sum(transfer * weights[:, None], axis=0) * (1.0 - lower) / 4.0
 
+@lru_cache(maxsize=256)
+def _read_edpl_csv(file_path_str, mtime_ns):
+    return pd.read_csv(file_path_str)
+
+
+def _find_edpl_file(edpl_folder, z):
+    p = Path(edpl_folder)
+    direct = p / f"ZA{z:03d}_extracted.csv"
+    if direct.is_file():
+        return direct
+    candidates = [c for c in p.glob(f"*ZA{z:03d}*.csv") if 'metadata' not in c.name.lower()]
+    return candidates[0] if candidates else None
+
+
 def klein_nishina_incoherent_mu(E_keV, z):
     """Free-electron Klein-Nishina incoherent mass attenuation (cm^2/g).
     Fallback when no tabulated incoherent data (MT504) is available.
@@ -301,13 +315,11 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                         and np.any((phi_in > 0) & (E_in >= FLUOR_K[z]['K_edge'])))
         have_k_data = False
         if edpl_folder and (needs_k_data or calc_scatter):
-            # Try to find file ZA{z:03d}*.csv
-            p = Path(edpl_folder)
-            candidates = list(p.glob(f"*ZA{z:03d}*.csv"))
-            candidates = [c for c in candidates if 'metadata' not in c.name.lower()]
-            if candidates:
+            edpl_file = _find_edpl_file(edpl_folder, z)
+            if edpl_file is not None:
                 try:
-                    df_edpl = pd.read_csv(candidates[0])
+                    resolved = edpl_file.resolve()
+                    df_edpl = _read_edpl_csv(str(resolved), resolved.stat().st_mtime_ns)
                     # Check for required columns
                     tau_col = None
                     if 'tauK_over_rho_cm2_per_g' in df_edpl.columns:
@@ -328,7 +340,7 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
                         tauK_eff = np.interp(E_in, df_edpl['E_keV'], df_edpl[tau_col], left=0, right=0)
                         have_k_data = True
                     else:
-                        print(f"Warning: EPDL file for Z={z} ({candidates[0]}) missing required columns.")
+                        print(f"Warning: EPDL file for Z={z} ({edpl_file}) missing required columns.")
 
                     if 'E_keV' in df_edpl.columns and 'MT504' in df_edpl.columns:
                         mu_incoh = interpolate_attenuation(E_in, df_edpl['E_keV'], df_edpl['MT504'])
@@ -387,13 +399,14 @@ def process_single_layer(E_in, phi_in, material, thickness_mm, att_df, edpl_fold
             add_line_density(phi_fluorescence, E_in, line_energy, photons, dE)
 
     # 5. Compton (incoherent) Scatter Fog
-    # Single-scatter KN angles, Compton energy loss and oblique escape.
+    # Single-scatter Waller-Hartree (KN * S(q, Z)) angles, Compton energy loss and oblique escape.
     phi_scatter = np.zeros_like(phi_in)
     if calc_scatter and beam_angle > 0:
         phi_scatter = single_scatter_spectrum(
             E_in, phi_in, mu_tot, mu_incoh, rho_t, beam_angle,
             lambda energy: interpolate_attenuation(energy, elem_att['Energy_KeV'], elem_att['Mu_over_rho']),
             bin_widths=dE,
+            atomic_number=z,
         )
 
     phi_total = phi_transmitted + phi_fluorescence + phi_scatter

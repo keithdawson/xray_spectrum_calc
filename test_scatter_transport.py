@@ -7,6 +7,8 @@ import numpy as np
 from scatter_transport import (
     ELECTRON_REST_ENERGY_KEV,
     THOMSON_CROSS_SECTION_CM2,
+    incoherent_angular_density,
+    incoherent_scattering_function,
     klein_nishina_angular_density,
     klein_nishina_total_cross_section,
     single_scatter_spectrum,
@@ -162,6 +164,49 @@ class TestScatterTransport(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     single_scatter_spectrum(energy, spectrum, 1.0, 0.2, thickness, angle,
                                             lambda e: np.ones_like(e))
+        with self.assertRaises(ValueError):
+            single_scatter_spectrum([50.0, 100.0], [1.0, 1.0], 1.0, 0.2, 0.1, 30.0,
+                                    lambda e: np.ones_like(e), atomic_number=0)
+
+    def test_waller_hartree_binding_suppresses_forward_scatter_and_normalizes(self):
+        for z in (13, 29, 42, 74, 82):
+            self.assertEqual(incoherent_scattering_function(z, 0.0), 0.0)
+            self.assertAlmostEqual(incoherent_scattering_function(z, 60.0), float(z))
+            self.assertTrue(np.all(np.diff(
+                incoherent_scattering_function(z, np.geomspace(1e-4, 50.0, 50))) >= 0))
+
+        # Integration in s = sin(theta/2) verifies unit normalization over [-1, 1].
+        nodes, weights = np.polynomial.legendre.leggauss(128)
+        s = 0.5 * (nodes + 1.0)
+        cosines = 1.0 - 2.0 * s**2
+        jacobian_weights = 2.0 * s * weights
+        energies = np.array([10.0, 30.0, 60.0, 100.0, 225.0])
+        for z in (13, 29, 42, 74):
+            density = incoherent_angular_density(energies[:, None], cosines, atomic_number=z)
+            np.testing.assert_allclose(density @ jacobian_weights, np.ones(energies.size), rtol=2e-5)
+            np.testing.assert_array_equal(
+                incoherent_angular_density(energies, 1.0, atomic_number=z), np.zeros(energies.size))
+
+        # Bound-electron suppression reduces 30-deg forward-cone scatter vs free-electron KN,
+        # while adaptive quadrature matches a 200,000-point reference integral.
+        energy = np.linspace(1.0, 120.0, 1191)
+        widths = np.gradient(energy)
+        spectrum = np.zeros_like(energy)
+        source_bin = np.argmin(np.abs(energy - 60.0))
+        spectrum[source_bin] = 1.0 / widths[source_bin]
+        free_scatter = single_scatter_spectrum(
+            energy, spectrum, 0.3, 0.2, 0.1, 30.0, lambda e: np.full_like(e, 0.3))
+        bound_scatter = single_scatter_spectrum(
+            energy, spectrum, 0.3, 0.2, 0.1, 30.0, lambda e: np.full_like(e, 0.3),
+            atomic_number=74)
+        self.assertLess(np.sum(bound_scatter * widths), 0.5 * np.sum(free_scatter * widths))
+
+        cos_min = np.cos(np.deg2rad(15.0))
+        dc = (1.0 - cos_min) / 200000
+        cosine = cos_min + (np.arange(200000) + 0.5) * dc
+        escape = (np.exp(-0.03) - np.exp(-0.03 / cosine)) / (0.3 / cosine - 0.3)
+        expected = np.sum(0.2 * escape * incoherent_angular_density(60.0, cosine, atomic_number=74) * dc)
+        self.assertAlmostEqual(np.sum(bound_scatter * widths) / expected, 1.0, places=5)
 
 
 if __name__ == "__main__":

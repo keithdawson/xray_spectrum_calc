@@ -122,14 +122,21 @@ def run_filter_optimization(energies, raw_photons, target_a_mat, target_a_thick,
     return sweep, optimum
 
 import apply_filter_and_fluorescence as aff
+from ct_physics import _attenuation_table
 
-def run_fluorescence_optimization(energies, raw_photons, mat1, thick1, candidate_materials=None, geom_params=None, downstream_transmission=None):
-    """Rank second filters by fluorescence-energy suppression and primary retention.
+
+def run_fluorescence_optimization(energies, raw_photons, mat1, thick1, candidate_materials=None, geom_params=None, downstream_transmission=None, include_scatter=False):
+    """Rank second filters by secondary-energy suppression and primary retention.
 
     Count fluorescence induced by both the primary beam and upstream
-    fluorescence. Scatter is excluded from this specific objective. Optional
-    downstream_transmission weights the spectra after both filters (e.g. air
-    attenuation to the target); it must not change the spectrum exciting them.
+    fluorescence. When ``include_scatter=False`` (default), scatter is excluded
+    and ``Score`` uses ``F_elim * P_kept**2``. When ``include_scatter=True``,
+    Compton scatter from both layers is included and ``Score`` uses
+    ``Secondary_elim * P_kept**2`` (preventing thick low-Z filters that replace
+    K-fluorescence with heavier Compton scatter fog from ranking artificially
+    high). Optional ``downstream_transmission`` weights the spectra after both
+    filters (e.g. air attenuation to the target); it must not change the
+    spectrum exciting them.
     """
     energies, raw_photons = validate_spectrum(energies, raw_photons)
     downstream = (np.ones_like(energies) if downstream_transmission is None
@@ -138,22 +145,26 @@ def run_fluorescence_optimization(energies, raw_photons, mat1, thick1, candidate
             or np.any(downstream < 0) or np.any(downstream > 1)):
         raise ValueError('Downstream transmission must match the energy grid and lie between 0 and 1.')
     root = Path(__file__).resolve().parent
-    att_df = pd.read_csv(root / 'attenuation_coefficients_long.csv')
+    att_df = _attenuation_table()
     edpl_folder = root / 'pyne_edpl'
     
     geom_params = {'beam_angle_deg': 30.0} if geom_params is None else dict(geom_params)
+    calc_scatter = bool(include_scatter)
     
     # 1. Base Layer (Filter 1)
-    _, phi_fluor1, _, trans_factor1 = aff.process_single_layer(
-        energies, raw_photons, mat1, thick1, att_df, edpl_folder, geom_params, calc_fluorescence=True, calc_scatter=False
+    _, phi_fluor1, phi_scatter1, trans_factor1 = aff.process_single_layer(
+        energies, raw_photons, mat1, thick1, att_df, edpl_folder, geom_params,
+        calc_fluorescence=True, calc_scatter=calc_scatter
     )
     phi_trans1 = raw_photons * trans_factor1
     
-    # Base Power and Fluorescence Power
+    # Base Power, Fluorescence Power, and Scatter Power
     P0 = integrate_spectrum(energies, phi_trans1 * energies * downstream)
     F0 = integrate_spectrum(energies, phi_fluor1 * energies * downstream)
+    S0 = integrate_spectrum(energies, phi_scatter1 * energies * downstream) if calc_scatter else 0.0
+    Sec0 = F0 + S0
     
-    if P0 <= 0 or F0 <= 0:
+    if P0 <= 0 or (Sec0 <= 0 if calc_scatter else F0 <= 0):
         return pd.DataFrame(), pd.DataFrame()
         
     if candidate_materials is None:
@@ -164,34 +175,50 @@ def run_fluorescence_optimization(energies, raw_photons, mat1, thick1, candidate
     
     for mat2 in candidate_materials:
         for t2 in thicknesses:
-            _, phi_fluor_from_main2, _, trans_factor2 = aff.process_single_layer(
-                energies, phi_trans1, mat2, t2, att_df, edpl_folder, geom_params, calc_fluorescence=True, calc_scatter=False
+            _, phi_fluor_from_main2, phi_scatter_from_main2, trans_factor2 = aff.process_single_layer(
+                energies, phi_trans1, mat2, t2, att_df, edpl_folder, geom_params,
+                calc_fluorescence=True, calc_scatter=calc_scatter
             )
             phi_trans2 = phi_trans1 * trans_factor2
             
             # Upstream fluorescence can excite lower-Z fluorescence in layer 2.
-            phi_fluor1_attenuated_total, _, _, _ = aff.process_single_layer(
-                energies, phi_fluor1, mat2, t2, att_df, edpl_folder, geom_params, calc_fluorescence=True, calc_scatter=False
+            phi_fluor1_out, _, phi_scatter_from_fluor1, _ = aff.process_single_layer(
+                energies, phi_fluor1, mat2, t2, att_df, edpl_folder, geom_params,
+                calc_fluorescence=True, calc_scatter=calc_scatter
             )
+            phi_fluor1_attenuated_total = phi_fluor1_out - phi_scatter_from_fluor1
             
             P = integrate_spectrum(energies, phi_trans2 * energies * downstream)
             total_F_spectrum = phi_fluor1_attenuated_total + phi_fluor_from_main2
             F = integrate_spectrum(energies, total_F_spectrum * energies * downstream)
+            if calc_scatter:
+                total_S_spectrum = (
+                    phi_scatter1 * trans_factor2 + phi_scatter_from_main2 + phi_scatter_from_fluor1
+                )
+                S = integrate_spectrum(energies, total_S_spectrum * energies * downstream)
+            else:
+                S = 0.0
+            Sec = F + S
             
-            p_kept = P / P0 if P0 > 0 else 0
-            f_elim = 1.0 - (F / F0) if F0 > 0 else 0
-            # Negative elimination exposes filters that add fluorescence;
+            p_kept = P / P0 if P0 > 0 else 0.0
+            f_elim = 1.0 - (F / F0) if F0 > 0 else 0.0
+            sec_elim = 1.0 - (Sec / Sec0) if Sec0 > 0 else 0.0
+            # Negative elimination exposes filters that add fluorescence/scatter;
             # the zero-thickness candidate always offers an unchanged beam.
-            score = f_elim * (p_kept ** 2)
+            active_elim = sec_elim if calc_scatter else f_elim
+            score = active_elim * (p_kept ** 2)
             
             results.append({
                 'Filter_Material': mat2,
                 'Thickness_mm': t2,
                 'P_kept': p_kept,
                 'F_elim': f_elim,
+                'Secondary_elim': sec_elim,
                 'Score': score,
                 'P_Total': P,
-                'F_Total': F
+                'F_Total': F,
+                'S_Total': S,
+                'Secondary_Total': Sec,
             })
             
     if not results:

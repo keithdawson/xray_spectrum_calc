@@ -237,6 +237,44 @@ class FluorescenceOptimizerTests(unittest.TestCase):
         self.assertEqual(optimum.iloc[0]['Thickness_mm'], 0.0)
         self.assertEqual(optimum.iloc[0]['F_elim'], 0.0)
 
+    def test_include_scatter_penalizes_scatter_producing_secondary_filter(self):
+        energies = np.array([10.0, 20.0, 40.0])
+        primary = np.array([0.0, 0.0, 10.0])
+        fluorescence = np.array([0.0, 2.0, 0.0])
+        scatter1 = np.array([0.0, 0.0, 0.2])
+
+        def layer(energies, photons, material, thickness, table, folder, geometry,
+                  calc_fluorescence, calc_scatter):
+            if material == 'First':
+                s_out = scatter1 if calc_scatter else np.zeros(3)
+                return primary + fluorescence + s_out, fluorescence, s_out, np.ones(3)
+            if thickness == 0:
+                return photons, np.zeros(3), np.zeros(3), np.ones(3)
+            # CleanFilter absorbs 80% of 20-keV fluorescence with minimal scatter;
+            # ScatterFilter absorbs 85% of fluorescence but generates heavy scatter from primary.
+            if material == 'CleanFilter':
+                trans = np.array([0.8, 0.2, 0.9])
+                s_out = np.array([0.0, 0.0, 0.02]) if (calc_scatter and photons[2] > 0) else np.zeros(3)
+            else:
+                trans = np.array([0.8, 0.15, 0.9])
+                s_out = np.array([0.0, 0.0, 1.5]) if (calc_scatter and photons[2] > 0) else np.zeros(3)
+            return photons * trans + s_out, np.zeros(3), s_out, trans
+
+        with patch.object(ct_optimizer.aff, 'process_single_layer', side_effect=layer):
+            _, top_fluor_only = ct_optimizer.run_fluorescence_optimization(
+                energies, primary, 'First', 0.1,
+                candidate_materials=['CleanFilter', 'ScatterFilter'],
+                include_scatter=False,
+            )
+            _, top_with_scatter = ct_optimizer.run_fluorescence_optimization(
+                energies, primary, 'First', 0.1,
+                candidate_materials=['CleanFilter', 'ScatterFilter'],
+                include_scatter=True,
+            )
+        self.assertEqual(top_fluor_only.iloc[0]['Filter_Material'], 'ScatterFilter')
+        self.assertEqual(top_with_scatter.iloc[0]['Filter_Material'], 'CleanFilter')
+        self.assertGreater(top_with_scatter.iloc[0]['Secondary_elim'], 0.5)
+
 
 if __name__ == '__main__':
     unittest.main(verbosity=2)
